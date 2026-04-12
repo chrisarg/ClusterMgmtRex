@@ -50,31 +50,31 @@ GetOptions(
 ) or die "Usage: $0 [--db path] [--keyfile path] [--import dir] [--users-csv path]\n";
 
 if ($help) {
-    say <<'USAGE';
-Initialize the cluster SSH public key database.
+    say <<~'USAGE';
+        Initialize the cluster SSH public key database.
 
-Options:
-  --db        PATH    Database file path (default: ./cluster_keys.db)
-  --keyfile   PATH    Encryption keyfile (default: ./.cluster_db.keyfile)
-  --import    DIR     Directory of .pub files to import (default: ./pubkeys)
-  --users-csv PATH    CSV file with credentials to import (default: ../system_db_setup/users_db.csv)
-  --help              Show this help
+        Options:
+        --db        PATH    Database file path (default: ./cluster_keys.db)
+        --keyfile   PATH    Encryption keyfile (default: ./.cluster_db.keyfile)
+        --import    DIR     Directory of .pub files to import (default: ./pubkeys)
+        --users-csv PATH    CSV file with credentials to import (default: ../system_db_setup/users_db.csv)
+        --help              Show this help
 
-Environment:
-  CLUSTER_DB_KEY     Encryption passphrase (alternative to --keyfile)
+        Environment:
+        CLUSTER_DB_KEY     Encryption passphrase (alternative to --keyfile)
 
-First-time setup:
-  openssl rand -base64 32 > .cluster_db.keyfile
-  chmod 400 .cluster_db.keyfile
-  perl init_cluster_db.pl
+        First-time setup:
+        openssl rand -base64 32 > .cluster_db.keyfile
+        chmod 400 .cluster_db.keyfile
+        perl init_cluster_db.pl
 
-DISA-STIG-aligned security practice notes:
-  - AES-256-GCM authenticated encryption [FIPS-140]
-  - PBKDF2-SHA256 key derivation, 600,000 iterations (NIST SP 800-132)
-  - Database file permissions enforced at 0600
-  - Keyfile permissions must be 0400 (owner read-only)
-  - All operations produce audit log entries [SEC-AUDIT-LOG]
-USAGE
+        DISA-STIG-aligned security practice notes:
+        - AES-256-GCM authenticated encryption [FIPS-140]
+        - PBKDF2-SHA256 key derivation, 600,000 iterations (NIST SP 800-132)
+        - Database file permissions enforced at 0600
+        - Keyfile permissions must be 0400 (owner read-only)
+        - All operations produce audit log entries [SEC-AUDIT-LOG]
+        USAGE
     exit 0;
 }
 

@@ -1460,7 +1460,7 @@ task "setup_ssh_keys", sub {
               or die "Cannot open $admin_ssh_config: $!\n";
             print $fh "\n$ssh_config_block\n";
             close $fh;
-            chmod 0600, $admin_ssh_config;
+            CORE::chmod 0600, $admin_ssh_config;
             say "  - $admin_machine (admin): updated ~/.ssh/config";
             audit_log( 'ssh_config_deployed',
                 machine => "$admin_machine (admin)" );
