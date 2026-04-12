@@ -9,7 +9,7 @@ Core design goals:
 - Use key-based SSH for all normal operations (operational mode)
 - All mutating operations produce timestamped audit log entries
 
-AI Disclaimer:
+**AI Disclaimer:**
 This project started as a manual Rex file configuration, and relied heavily on AI additions (mostly via Claude) to refine security measures. In the process, I found that the AI would hallucinate DISA-STIG rules, generate bloatware and at some point even switched to Python (lolz) for tasks. Still the code generation for what I wanted to do (whether the code is actually doing it is a separate issue), was way faster than if I had written the code myself. Manual editing and review is far from complete at the time of this writing (April 12th 2026), so caveat emptor. If you decide to enter the chamber of AI horrors, would very much appreciate feedback or PRs. Having the ability to manage small networks e.g. in homelabs or small research laboratories in a secure manner is a valuable task. 
 
 ## What the Code Does
