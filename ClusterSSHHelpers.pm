@@ -236,9 +236,9 @@ sub validate_name {
 # ---------------------------------------------------------------------------
 
 # Detect the admin machine — the one whose IP on this network matches a local IP.
+# Assumption: the machine executing this script is the admin node.
 # If $network_name is given, match only that network; otherwise match any network.
 # Returns ($admin_ip, $admin_machine) or (undef, undef).
-# Uses Rex::CMDB::get() which must be available in the caller's environment.
 sub detect_admin {
     my ($network_name) = @_;
     my @local_ips =
@@ -748,12 +748,14 @@ sub cleanup_io_interface {
     }
 }
 
-# Safe wrapper around Rex::CMDB::get('networks', $machine).
-# Rex CMDB may return '' instead of undef for missing keys;
-# this always returns a hashref.
+# Safe wrapper around Rex CMDB network lookups.
+# cmdb() returns a Rex::Value wrapper; we unwrap via ->value.
+# Always returns a hashref (empty {} if missing or non-hash).
 sub get_networks {
     my ($machine) = @_;
-    my $nets = Rex::CMDB::get( 'networks', $machine );
+    my $val = Rex::CMDB::cmdb( 'networks', $machine );
+    return {} unless defined $val && ref $val eq 'Rex::Value';
+    my $nets = $val->value;
     return ref $nets eq 'HASH' ? $nets : {};
 }
 

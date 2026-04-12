@@ -31,7 +31,7 @@ Pure-Perl encrypted database module. Provides:
 Shared helper module used by the Rexfile (and available to other Rexfiles). Provides:
 - `ssh_opts` / `ssh_opts_bootstrap` — SSH option builders for operational and bootstrap modes
 - `audit_log` — timestamped audit logging [SEC-AUDIT-LOG]
-- `detect_admin` — identify the admin machine by matching local IPs to CMDB
+- `detect_admin` — identify the admin machine by matching local IPs to CMDB (assumes the machine executing the script is the admin node)
 - `tcp_pinger` — create a Net::Ping TCP prober on port 22
 - `resolve_targets` — resolve `--group`/`--machine` parameters into a target list
 - `validate_name` — input validation against shell injection
@@ -135,6 +135,10 @@ external rule IDs) that describe the actual security property enforced.
 | SEC-FIPS-ALGO | FIPS-approved key algorithms | ECDSA P-521 for key generation; `ssh-keyscan` restricted to `ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521` |
 | SEC-AUDIT-LOG | Audit logging | All mutating operations write a timestamped ISO-8601 entry to `logs/audit.log`; log file enforced to 0600 |
 | FIPS-140 | Approved cipher and KDF | AES-256-GCM (NIST SP 800-38D); PBKDF2-SHA256 at 600,000 iterations (NIST SP 800-132) |
+
+### Key assumptions
+
+- **Admin node = executing machine**: `detect_admin` identifies the admin by matching the local machine's IP addresses (via `hostname -I`) against the CMDB network entries. The machine running the Rex tasks is always treated as the admin node.
 
 ### sudoers prerequisites for hardened systems
 
