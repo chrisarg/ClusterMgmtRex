@@ -1,5 +1,8 @@
 # Repository-level ignore policy
 
+# vscode settings and local IDE project files
+.vscode/
+
 # Sensitive source data
 system_db_setup/*.csv
 
