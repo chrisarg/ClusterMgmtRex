@@ -10,7 +10,7 @@ Core design goals:
 - All mutating operations produce timestamped audit log entries
 
 **AI Disclaimer:**
-This project started as a manual Rex file configuration, and relied heavily on AI additions (mostly via Claude) to refine security measures. In the process, I found that the AI would hallucinate DISA-STIG rules, generate bloatware and at some point even switched to Python (lolz) for tasks. Still the code generation for what I wanted to do (whether the code is actually doing it is a separate issue), was way faster than if I had written the code myself. Manual editing and review is far from complete at the time of this writing (April 12th 2026), so caveat emptor. If you decide to enter the chamber of AI horrors, would very much appreciate feedback or PRs. Having the ability to manage small networks e.g. in homelabs or small research laboratories in a secure manner is a valuable task. 
+This project started as a manual Rex file configuration, and relied heavily on AI additions (mostly via Claude) to refine security measures. In the process, I found that the AI would hallucinate DISA-STIG rules, generate bloatware and at some point even switched to Python (lolz) for tasks. Still the code generation for what I wanted to do (whether the code is actually doing it is a separate issue), was way faster than if I had written the code myself. Manual editing and review is far from complete at the time of this writing (April 12th 2026), so caveat emptor. If you decide to enter the chamber of AI horrors, would very much appreciate feedback or PRs. Having the ability to manage small networks e.g. in homelabs or small research laboratories in a secure manner is a valuable task,and the value of the task justifies the AI bootstrap (IMHO).
 
 ## What the Code Does
 
@@ -99,6 +99,8 @@ Reverses all `setup_ssh_keys` changes: removes keypairs, the three node-local pa
   - pubkeys/: staging area for SSH public key files to import into the encrypted DB. Place `<machine>.pub` files here before running `init_cluster_db.pl`; they are imported automatically. The directory is empty by default and is not required for normal CSV-driven workflows.
   - (git-ignored) cluster_keys.db — encrypted SQLite database
   - (git-ignored) .cluster_db.keyfile — master encryption key
+- example_hpc_deployments/
+  - README.md : Examples of provisioning of software for HPC pipelines
 - system_db_setup/
   - (git-ignored) users_db.csv: input credentials for encrypted DB import
   - (git-ignored) networks_db.csv: network inventory input
