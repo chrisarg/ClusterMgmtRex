@@ -25,6 +25,8 @@
 # ---------------------------------------------------------------------------
 
 use v5.38;
+use feature 'try';
+no warnings 'experimental::try';
 use FindBin qw($Bin);
 use lib $Bin;
 use File::Spec;
@@ -121,10 +123,12 @@ if ( -d $import_dir ) {
             }
 
             # Compute fingerprint via ssh-keygen
-            my $fingerprint = eval {
+            my $fingerprint = '';
+            try {
                 chomp( my $fp = `ssh-keygen -lf \Q$file\E 2>/dev/null` );
-                $fp;
-            } // '';
+                $fingerprint = $fp;
+            }
+            catch ($e) { }
 
             $db->store_key(
                 machine     => $name,

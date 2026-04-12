@@ -1,4 +1,6 @@
 use v5.38;
+use feature 'try';
+no warnings 'experimental::try';
 use Rex -feature => ['1.4'];
 use Rex::Commands::Run;
 use Rex::Commands::File;
@@ -22,15 +24,21 @@ use Net::Ping;
 use ClusterSSHHelpers;
 
 # Encrypted key database support [SEC-CRED-ENCRYPT]: no plaintext keys on disk
-my $HAS_CLUSTER_DB = eval {
+my $HAS_CLUSTER_DB;
+try {
     my $db_lib = abs_path('../createdatabase');
     if ( $db_lib && -d $db_lib ) {
         unshift @INC, $db_lib;
         require ClusterDB;
-        return 1;
+        $HAS_CLUSTER_DB = 1;
     }
-    return 0;
-};
+    else {
+        $HAS_CLUSTER_DB = 0;
+    }
+}
+catch ($e) {
+    $HAS_CLUSTER_DB = 0;
+}
 
 # ---------------------------------------------------------------------------
 # Security Practice Labels & FIPS-140 Compliance Configuration
@@ -400,11 +408,13 @@ task "show_known_hosts", sub {
         }
 
         my $target  = "$username\@$ip";
-        my $entries = eval {
-            capturex( 'ssh', @ssh_opts, $target,
+        my $entries;
+        try {
+            $entries = capturex( 'ssh', @ssh_opts, $target,
                     'ssh-keygen -F "" -f ~/.ssh/known_hosts 2>/dev/null | '
                   . 'grep -v "^#" || cat ~/.ssh/known_hosts 2>/dev/null' );
-        };
+        }
+        catch ($e) { }
 
         say "\n" . "-" x 60;
         say "$machine ($ip):";
@@ -531,10 +541,12 @@ task "rm_dup_hosts", sub {
         my $target = "$username\@$ip";
 
         # Read existing known_hosts
-        my $raw = eval {
-            capturex( 'ssh', @ssh_opts, $target,
+        my $raw;
+        try {
+            $raw = capturex( 'ssh', @ssh_opts, $target,
                 'cat ~/.ssh/known_hosts 2>/dev/null' );
-        };
+        }
+        catch ($e) { }
 
         my ( @kept, %key_seen, $removed );
         $removed = 0;
@@ -715,10 +727,12 @@ task "setup_ssh_keys", sub {
             <$f>;
         };
         chomp $pub_content;
-        my $fp = eval {
+        my $fp = '';
+        try {
             chomp( my $f = capturex( 'ssh-keygen', '-lf', $pub_key ) );
-            $f;
-        } // '';
+            $fp = $f;
+        }
+        catch ($e) { }
         $db->store_key(
             machine     => 'admin',
             key_type    => 'ecdsa-sha2-nistp521',
@@ -807,10 +821,12 @@ task "setup_ssh_keys", sub {
         my $ip           = $node->{ip};
         my $connect_host = $network_name . $node->{machine};
         say "  - scanning $node->{machine} ($ip)";
-        my $keyscan_out = eval {
-            capturex( 'ssh-keyscan', '-T', '5',
+        my $keyscan_out;
+        try {
+            $keyscan_out = capturex( 'ssh-keyscan', '-T', '5',
                 '-t', $FIPS_KEYSCAN_TYPES, $ip );
-        };
+        }
+        catch ($e) { }
         if ( !$keyscan_out ) {
             say "  ! keyscan failed for $node->{machine} ($ip), skipping";
             next;
@@ -921,11 +937,13 @@ task "setup_ssh_keys", sub {
         my $node_pp;
 
         # Check if key already exists on the node
-        my $key_exists = eval {
-            bootstrap_capturex( $pass,
+        my $key_exists = '';
+        try {
+            $key_exists = bootstrap_capturex( $pass,
                 'sshpass', '-e', 'ssh', @ssh_opts_bootstrap,
                 $target,   'test -f ~/.ssh/id_ecdsa_p521_cluster && echo YES' );
-        } // '';
+        }
+        catch ($e) { }
         chomp $key_exists;
 
         if ( $key_exists ne 'YES' ) {
@@ -1003,10 +1021,12 @@ task "setup_ssh_keys", sub {
             say "  - deploying node-local passphrase store";
 
             # Generate a fresh per-node keyfile (unique per node, per run)
-            my $node_keyfile_content = eval {
+            my $node_keyfile_content;
+            try {
                 chomp( my $k = capturex( 'openssl', 'rand', '-base64', '32' ) );
-                $k;
-            };
+                $node_keyfile_content = $k;
+            }
+            catch ($e) { }
             unless ($node_keyfile_content) {
                 say "  ! Failed to generate keyfile for $node->{machine},"
                   . " skipping passphrase store";
@@ -1027,14 +1047,16 @@ task "setup_ssh_keys", sub {
                 CORE::chmod 0400, $kf_local;
 
                 # Encrypt: AES-256-CBC, PBKDF2-SHA256, 600000 iterations
-                my $enc_ok = eval {
+                my $enc_ok;
+                try {
                     systemx(
                         'openssl', 'enc',    '-aes-256-cbc', '-pbkdf2',
                         '-iter',   '600000', '-pass', "file:$kf_local",
                         '-in',     $pp_plain, '-out', $pp_enc
                     );
-                    1;
-                };
+                    $enc_ok = 1;
+                }
+                catch ($e) { }
                 unlink $pp_plain;
 
                 if ( !$enc_ok ) {
@@ -1123,11 +1145,13 @@ task "setup_ssh_keys", sub {
 
         # Collect the node's public key
         say "  - collecting public key";
-        my $node_pub = eval {
-            bootstrap_capturex( $pass,
+        my $node_pub;
+        try {
+            $node_pub = bootstrap_capturex( $pass,
                 'sshpass', '-e', 'ssh', @ssh_opts_bootstrap,
                 $target,   'cat ~/.ssh/id_ecdsa_p521_cluster.pub' );
-        };
+        }
+        catch ($e) { }
         if ( !$node_pub || $node_pub !~ /^ecdsa-sha2/ ) {
             say "  ! Failed to collect public key from $node->{machine},"
               . " skipping";
@@ -1164,10 +1188,12 @@ task "setup_ssh_keys", sub {
             );
             print $tmp_fh "$node_pubkeys{$machine}\n";
             close $tmp_fh;
-            $fp = eval {
+            $fp = '';
+            try {
                 chomp( my $f = capturex( 'ssh-keygen', '-lf', $tmp_pub ) );
-                $f;
-            } // '';
+                $fp = $f;
+            }
+            catch ($e) { }
             unlink $tmp_pub;
             $db->store_key(
                 machine     => $machine,
@@ -1230,11 +1256,13 @@ task "setup_ssh_keys", sub {
         my $pass   = $node->{password};
 
         # Read remote authorized_keys
-        my $remote_auth = eval {
-            bootstrap_capturex( $pass,
+        my $remote_auth = '';
+        try {
+            $remote_auth = bootstrap_capturex( $pass,
                 'sshpass', '-e', 'ssh', @ssh_opts_bootstrap,
                 $target,   'cat ~/.ssh/authorized_keys 2>/dev/null' );
-        } // '';
+        }
+        catch ($e) { }
         my %remote_already =
           map { chomp; $_ => 1 } split /\n/, $remote_auth;
 
@@ -1297,10 +1325,12 @@ task "setup_ssh_keys", sub {
         # Scan by IP only with FIPS-approved types, then build merged lines.
         my $admin_host_key;
         {
-            my $raw = eval {
-                capturex( 'ssh-keyscan', '-T', '5',
+            my $raw;
+            try {
+                $raw = capturex( 'ssh-keyscan', '-T', '5',
                     '-t', $FIPS_KEYSCAN_TYPES, $admin_ip );
-            };
+            }
+            catch ($e) { }
             if ($raw) {
                 $admin_host_key = join '', map {
                     my ( $hf, $kt, $km ) = kh_key($_);
@@ -1323,11 +1353,13 @@ task "setup_ssh_keys", sub {
                 say "  - updating $node->{machine} ($node->{ip})";
 
                 # Read remote known_hosts
-                my $remote_kh = eval {
-                    bootstrap_capturex( $pass,
+                my $remote_kh;
+                try {
+                    $remote_kh = bootstrap_capturex( $pass,
                         'sshpass', '-e', 'ssh', @ssh_opts_bootstrap,
                         $target,   'cat ~/.ssh/known_hosts 2>/dev/null' );
-                };
+                }
+                catch ($e) { }
 
              # Combined drop set: admin + all cluster nodes (all replaced fresh)
                 my %replace_host_ids = (
@@ -1444,11 +1476,13 @@ task "setup_ssh_keys", sub {
         my $pass   = $node->{password};
 
         # Check if remote ~/.ssh/config already has the IdentityFile
-        my $remote_config = eval {
-            bootstrap_capturex( $pass,
+        my $remote_config = '';
+        try {
+            $remote_config = bootstrap_capturex( $pass,
                 'sshpass', '-e', 'ssh', @ssh_opts_bootstrap,
                 $target,   'cat ~/.ssh/config 2>/dev/null' );
-        } // '';
+        }
+        catch ($e) { }
 
         if ( $remote_config =~ /IdentityFile.*id_ecdsa_p521_cluster/ ) {
             say "  - $node->{machine} ($node->{ip}): "
@@ -1558,11 +1592,13 @@ task "setup_ssh_keys", sub {
             my $pass         = $node->{password};
             my $remote_alias = $network_name . $node->{machine};
 
-            my $remote_hosts_raw = eval {
-                bootstrap_capturex( $pass,
+            my $remote_hosts_raw;
+            try {
+                $remote_hosts_raw = bootstrap_capturex( $pass,
                     'sshpass', '-e', 'ssh', @ssh_opts_bootstrap,
                     $target,   'cat /etc/hosts 2>/dev/null' );
-            };
+            }
+            catch ($e) { }
             my %remote_has_alias;
             for my $line ( split /\n/, $remote_hosts_raw // '' ) {
                 next if $line =~ /^\s*(?:#|$)/;
@@ -2202,11 +2238,13 @@ s/\n*# --- cluster_mgmt: auto-generated block ---\n.*?# --- end cluster_mgmt ---
         my $pass   = $node->{password};
 
         # Fetch current /etc/hosts from node, filter locally
-        my $remote_raw = eval {
-            bootstrap_capturex( $pass,
+        my $remote_raw;
+        try {
+            $remote_raw = bootstrap_capturex( $pass,
                 'sshpass', '-e', 'ssh', @ssh_opts_bootstrap,
                 $target,   'cat /etc/hosts 2>/dev/null' );
-        };
+        }
+        catch ($e) { }
         my @remote_lines = split /^/m, $remote_raw // '';
 
         my @kept;
@@ -2854,11 +2892,13 @@ task "validate_ssh_mesh", sub {
 
                 # Admin is source: direct sshpass ssh to dst
                 local $ENV{SSHPASS} = $dst->{password};
-                my $ok = eval {
+                my $ok;
+                try {
                     capturex( 'sshpass', '-e', 'ssh', @ssh_opts_bootstrap,
                         "$dst_user\@$dst_ip", 'true' );
-                    1;
-                };
+                    $ok = 1;
+                }
+                catch ($e) { }
                 $result{password} = $ok ? 1 : 0;
             }
             else {
@@ -2887,11 +2927,13 @@ task "validate_ssh_mesh", sub {
                     "$src->{username}\@$src->{ip}",
                     '/tmp/.cl_XXXXXXXX' );
 
-                my $scp_ok = eval {
+                my $scp_ok;
+                try {
                     capturex( 'sshpass', '-e', 'scp', @ssh_opts_bootstrap,
                         $pw_local, "$src->{username}\@$src->{ip}:$remote_pw" );
-                    1;
-                };
+                    $scp_ok = 1;
+                }
+                catch ($e) { }
                 unlink $pw_local;
 
                 if ( !$scp_ok ) {
@@ -2919,11 +2961,13 @@ task "validate_ssh_mesh", sub {
                       . " $dst_user\@$dst_ip true"
                       . "; RC=\$?; rm -f $remote_pw \$RMTAP; exit \$RC";
                     local $ENV{SSHPASS} = $src->{password};
-                    my $ok = eval {
+                    my $ok;
+                    try {
                         capturex( 'sshpass', '-e', 'ssh', @ssh_opts_bootstrap,
                             "$src->{username}\@$src->{ip}", $inner_cmd );
-                        1;
-                    };
+                        $ok = 1;
+                    }
+                    catch ($e) { }
                     $result{password} = $ok ? 1 : 0;
                 }
             }
@@ -2932,7 +2976,8 @@ task "validate_ssh_mesh", sub {
             if ($is_local_src) {
 
                 # Admin is source: direct key-based ssh to dst
-                my $ok = eval {
+                my $ok;
+                try {
                     capturex(
                         'ssh',                           '-o',
                         'StrictHostKeyChecking=yes',     '-o',
@@ -2944,8 +2989,9 @@ task "validate_ssh_mesh", sub {
                         $cluster_key_path,               "$dst_user\@$dst_ip",
                         'true'
                     );
-                    1;
-                };
+                    $ok = 1;
+                }
+                catch ($e) { }
                 $result{key} = $ok ? 1 : 0;
             }
             else {
@@ -2956,12 +3002,13 @@ task "validate_ssh_mesh", sub {
                 # SSH_ASKPASS with the passphrase from ClusterDB, run the
                 # SSH test, then kill the agent.  Passphrase is SCP'd as a
                 # 0400 temp file (never in process args).
-                my $node_pp = eval {
+                my $node_pp;
+                try {
                     my $db = cluster_db();
-                    $db
-                      ? $db->get_key_passphrase( machine => $src->{machine} )
-                      : undef;
-                };
+                    $node_pp = $db->get_key_passphrase( machine => $src->{machine} )
+                      if $db;
+                }
+                catch ($e) { }
 
                 if ( !$node_pp ) {
                     $result{key}        = 0;
@@ -2984,11 +3031,13 @@ task "validate_ssh_mesh", sub {
                         "$src->{username}\@$src->{ip}",
                         '/tmp/.cl_XXXXXXXX' );
 
-                    my $scp_ok = eval {
+                    my $scp_ok;
+                    try {
                         capturex( 'sshpass', '-e', 'scp', @ssh_opts_bootstrap,
                             $pp_local, "$src->{username}\@$src->{ip}:$r_kpp" );
-                        1;
-                    };
+                        $scp_ok = 1;
+                    }
+                    catch ($e) { }
                     unlink $pp_local;
 
                     if ( !$scp_ok ) {
@@ -3030,12 +3079,14 @@ task "validate_ssh_mesh", sub {
                           . "; rm -f $r_kpp \$RMTKAP \$RMTAG"
                           . "; exit \$RC";
 
-                        my $ok = eval {
+                        my $ok;
+                        try {
                             capturex( 'sshpass', '-e', 'ssh',
                                 @ssh_opts_bootstrap,
                                 "$src->{username}\@$src->{ip}", $inner_cmd );
-                            1;
-                        };
+                            $ok = 1;
+                        }
+                        catch ($e) { }
                         $result{key} = $ok ? 1 : 0;
                     }
                 }

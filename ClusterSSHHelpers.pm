@@ -31,6 +31,8 @@ package ClusterSSHHelpers;
 # ---------------------------------------------------------------------------
 
 use v5.38;
+use feature 'try';
+no warnings 'experimental::try';
 use Exporter 'import';
 use File::Basename qw(dirname);
 use File::Path     qw(remove_tree);
@@ -164,7 +166,10 @@ sub kh_key {
 
 sub run_or_warn {
     my (@cmd) = @_;
-    if ( !eval { systemx(@cmd); 1 } ) {
+    try {
+        systemx(@cmd);
+    }
+    catch ($e) {
         warn "Command failed: " . join( ' ', @cmd ) . "\n";
         return 0;
     }
@@ -321,10 +326,13 @@ sub ensure_agent_loaded {
         }
         $out // '';
     };
-    my $fp = eval {
+    my $fp;
+    try {
         chomp( my $f = capturex( 'ssh-keygen', '-lf', $cluster_key_path ) );
-        ( split /\s+/, $f )[1];
-    } // '';
+        $fp = ( split /\s+/, $f )[1];
+    }
+    catch ($e) { }
+    $fp //= '';
 
     if ( $fp && $agent_keys =~ /\Q$fp\E/ ) {
         return 1;
@@ -359,7 +367,12 @@ sub ensure_agent_loaded {
     local $ENV{SSH_ASKPASS_REQUIRE} = 'force';
     local $ENV{DISPLAY}             = ':0';
 
-    my $ok = eval { systemx( 'ssh-add', $cluster_key_path ); 1 };
+    my $ok;
+    try {
+        systemx( 'ssh-add', $cluster_key_path );
+        $ok = 1;
+    }
+    catch ($e) { }
     unlink $pw_file, $ap_script;
 
     die "Failed to load cluster key into ssh-agent.\n"
@@ -377,17 +390,20 @@ sub cluster_db {
     return $db if $attempted;
     $attempted = 1;
     return undef unless $HAS_CLUSTER_DB;
-    my $passphrase =
-      eval { ClusterDB->get_passphrase( keyfile => $cluster_db_keyfile ); };
+    my $passphrase;
+    try {
+        $passphrase = ClusterDB->get_passphrase( keyfile => $cluster_db_keyfile );
+    }
+    catch ($e) { }
     return undef unless $passphrase;
-    $db = eval {
-        my $obj = ClusterDB->new(
+    try {
+        $db = ClusterDB->new(
             db_path    => $cluster_db_path,
             passphrase => $passphrase,
             audit_log  => $audit_log_path,
         );
-        $obj;
-    };
+    }
+    catch ($e) { }
     return $db;
 }
 
@@ -434,8 +450,14 @@ sub bootstrap_via_askpass {
     local $ENV{DISPLAY}             = $ENV{DISPLAY} // ':0';
     delete local $ENV{SSHPASS};
 
-    my $result = eval { $runner->(@cmd) };
-    my $err    = $@;
+    my $result;
+    my $err;
+    try {
+        $result = $runner->(@cmd);
+    }
+    catch ($e) {
+        $err = $e;
+    }
     unlink $pw_file, $ap_script;
     die $err if $err;
     return $result;
@@ -586,17 +608,26 @@ sub perl_can_load_io_interface {
     my $code   = 'require IO::Socket::INET; require IO::Interface; exit 0;';
 
     if ($local) {
-        return eval { capturex( 'perl', @libopt, '-e', $code ); 1 } ? 1 : 0;
+        try {
+            capturex( 'perl', @libopt, '-e', $code );
+            return 1;
+        }
+        catch ($e) {
+            return 0;
+        }
     }
 
     my @parts = ('perl');
     push @parts, '-I ' . shell_quote($libdir) if $libdir;
     push @parts, '-e ' . shell_quote($code);
     my $cmd = join ' ', @parts;
-    return eval {
+    try {
         capturex( 'ssh', @ssh_opts, $target, $cmd );
-        1;
-    } ? 1 : 0;
+        return 1;
+    }
+    catch ($e) {
+        return 0;
+    }
 }
 
 sub ensure_io_interface {
@@ -629,21 +660,22 @@ sub ensure_io_interface {
         );
     }
     else {
-        $prefix = eval {
+        try {
             chomp(
                 my $out = capturex(
                     'ssh',   @ssh_opts,
                     $target, 'mktemp -d /tmp/.cl_XXXXXXXX'
                 )
             );
-            $out;
-        };
+            $prefix = $out;
+        }
+        catch ($e) { }
         return undef if !$prefix || !length $prefix;
     }
     $libdir = "$prefix/lib/perl5";
 
     if ($local) {
-        return undef if !eval {
+        try {
             systemx(
                 'env',
                 'PERL_MM_USE_DEFAULT=1',
@@ -655,8 +687,10 @@ sub ensure_io_interface {
                 '-i',
                 'IO::Interface'
             );
-            1;
-        };
+        }
+        catch ($e) {
+            return undef;
+        }
     }
     else {
         my $install_cmd = join ' ',
@@ -667,10 +701,12 @@ sub ensure_io_interface {
           'PERL_MB_OPT=' . shell_quote("--install_base $prefix"),
           'cpan -T -i IO::Interface';
 
-        return undef if !eval {
+        try {
             capturex( 'ssh', @ssh_opts, $target, $install_cmd );
-            1;
-        };
+        }
+        catch ($e) {
+            return undef;
+        }
     }
 
     return undef
@@ -701,10 +737,13 @@ sub cleanup_io_interface {
     my $cmd  = join ' ', 'perl', '-e ' . shell_quote($code), '--',
       shell_quote($prefix);
 
-    return eval {
+    try {
         capturex( 'ssh', @ssh_opts, $target, $cmd );
-        1;
-    } ? 1 : 0;
+        return 1;
+    }
+    catch ($e) {
+        return 0;
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -729,18 +768,25 @@ sub get_mac_for_ip {
     my $code   = io_interface_probe_code();
 
     my $mac;
+    my $err;
     if ($local) {
-        $mac = eval { capturex( 'perl', @libopt, '-e', $code, '--', $ip ) };
+        try {
+            $mac = capturex( 'perl', @libopt, '-e', $code, '--', $ip );
+        }
+        catch ($e) { $err = $e; }
     }
     else {
         my @parts = ('perl');
         push @parts, '-I ' . shell_quote($libdir) if $libdir;
         push @parts, '-e ' . shell_quote($code), '--', shell_quote($ip);
         my $cmd = join ' ', @parts;
-        $mac = eval { capturex( 'ssh', @ssh_opts, $target, $cmd ); };
+        try {
+            $mac = capturex( 'ssh', @ssh_opts, $target, $cmd );
+        }
+        catch ($e) { $err = $e; }
     }
 
-    return undef if $@ || !defined $mac || !length $mac;
+    return undef if $err || !defined $mac || !length $mac;
     $mac =~ s/\s+//g;
     return length($mac) ? lc $mac : undef;
 }
