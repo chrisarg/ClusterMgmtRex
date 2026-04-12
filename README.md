@@ -463,6 +463,132 @@ rex setup_ssh_keys --network=labnet --bootstrap=1 --rekey=1
 
 ---
 
+---
+---
+
+## Blast Radius Analysis
+
+This section analyses what an attacker gains — and what remains protected — if a single cluster node is compromised. Two scenarios are considered: compromise of a non-admin (worker) node, and compromise of the admin node.
+
+### Definitions
+
+| Term | Meaning |
+|------|---------|
+| **Admin node** | The machine running Rex tasks. Holds the encrypted database, the master keyfile, and the admin keypair. |
+| **Worker node** | Any non-admin node in the cluster . Holds only its own keypair and the local passphrase store. |
+| **Mesh credential** | The credentials (username + password) for each node, stored encrypted in `cluster_keys.db` on the admin. |
+| **Node-local passphrase store** | Three files on each worker: `.cluster_node_keyfile` (0400), `.cluster_node_pp` (0400), `load_cluster_key.pl` (0500). Together they allow the node to decrypt its own SSH key passphrase. |
+
+### Scenario 1: Compromised Non-Admin (Worker) Node
+
+**Attacker gains access to one worker node** (e.g. via local privilege escalation, physical access, or an application-level exploit).
+
+#### What the attacker obtains
+
+| Asset | Location | Protection | Attacker access |
+|-------|----------|------------|-----------------|
+| Node's SSH private key | `~/.ssh/id_ecdsa_p521_cluster` | 0400, passphrase-protected | Has the file; can extract passphrase from local store (see below) |
+| Node-local passphrase store | `~/.ssh/.cluster_node_keyfile` + `~/.ssh/.cluster_node_pp` | 0400, AES-256-CBC PBKDF2-SHA256 600k iter | Both files are on the same node — attacker can decrypt the passphrase using `openssl enc -d` with the keyfile |
+| Node's `authorized_keys` | `~/.ssh/authorized_keys` | 0600 | Public keys of all peers + admin (public key material only — no secrets) |
+| Node's `known_hosts` | `~/.ssh/known_hosts` | 0600 | Host key fingerprints for all cluster nodes |
+| Node's `~/.ssh/config` | `~/.ssh/config` | 0600 | Cluster `IdentityFile` and `StrictHostKeyChecking` settings |
+
+#### Blast radius from a compromised worker
+
+| Impact | Scope | Details |
+|--------|-------|---------|
+| **Full SSH access as cluster user to every other node** | All nodes on the same network | The compromised node's key is in every peer's `authorized_keys`. The attacker can unlock the private key using the local passphrase store and reach any peer node — **this is the primary blast radius**. |
+| **SSH access to the admin node** | Admin node | The compromised node's key is also in the admin's `authorized_keys`. The attacker reaches the admin as the cluster user. |
+| **known_hosts intelligence** | Informational | IP addresses and host key fingerprints for all cluster nodes are exposed, aiding lateral movement. |
+| **Network knowledge** | Informational | `~/.ssh/config` and `/etc/hosts` entries reveal all cluster node aliases and IPs. |
+
+#### What the attacker does NOT obtain from a worker
+
+| Asset | Why it is safe |
+|-------|---------------|
+| **Other nodes' private keys** | Private keys are generated on-device and never leave their origin node. |
+| **Other nodes' passphrases** | Each node's passphrase store uses a unique keyfile; compromising one node's keyfile cannot decrypt another's. |
+| **Encrypted database (`cluster_keys.db`)** | Exists only on the admin node. |
+| **Master keyfile (`.cluster_db.keyfile`)** | Exists only on the admin node. |
+| **Plaintext passwords** | Passwords are never stored on worker nodes. They are used only during bootstrap (via SSH_ASKPASS tempfile) and are not persisted. |
+| **Admin's private key** | Only the admin's public key is deployed to workers (via `ssh-copy-id`). The private key stays on the admin. |
+
+#### Mitigation and containment
+
+1. **Revoke the compromised node's key from all peers**: Run `remove_ssh_keys` with `--machine=<compromised-node>`, then re-run `setup_ssh_keys --rekey=1 --machine=<compromised-node>` after the node is re-imaged or remediated.
+2. **Rotate all peer keys as a precaution**: If the attacker had time for lateral movement, rekey all nodes with `setup_ssh_keys --rekey=1` after forensic assessment.
+3. **Audit `logs/audit.log`**: Check for unexpected `setup_ssh_keys` or `remove_ssh_keys` activity.
+4. **Network-level isolation**: The blast radius is limited to nodes on the same network (e.g. WirA). An attacker on a WirA-only node cannot reach WirB-only nodes unless the compromised user account has keys for both networks.
+
+### Scenario 2: Compromised Admin Node
+
+**Attacker gains access to the admin node**  — the single point of control for the cluster.
+
+#### What the attacker obtains
+
+| Asset | Location | Protection | Attacker access |
+|-------|----------|------------|-----------------|
+| Admin's SSH private key | `~/.ssh/id_ecdsa_p521_cluster` | 0400, passphrase-protected | Has the file; passphrase is in the encrypted DB (see next row) |
+| Encrypted database | `createdatabase/cluster_keys.db` | AES-256-GCM, PBKDF2-SHA256 600k iter | Accessible if the attacker also obtains the keyfile |
+| Master keyfile | `createdatabase/.cluster_db.keyfile` | 0400 | On the same machine — attacker can read it with the cluster user's privileges |
+| **All passwords (decryptable)** | In `cluster_keys.db` | AES-256-GCM | With keyfile + DB, the attacker decrypts **every node's username and password** |
+| **All SSH key passphrases (decryptable)** | In `cluster_keys.db` | AES-256-GCM | With keyfile + DB, the attacker decrypts **every node's SSH key passphrase** — even for nodes the attacker has never touched |
+| **All public keys + fingerprints** | In `cluster_keys.db` | AES-256-GCM | Full inventory of all cluster SSH public keys |
+| Admin's `authorized_keys` | `~/.ssh/authorized_keys` | 0600 | Public keys of all worker nodes |
+| Admin's `known_hosts` | `~/.ssh/known_hosts` | 0600 | Host key fingerprints for all cluster nodes |
+| CMDB YAML files | `cmdb/*.yml` | Plaintext | All node IPs and MAC addresses across all networks |
+| Audit log | `logs/audit.log` | 0600 | Full history of all mutating operations — reveals cluster topology and key rotation history |
+| Source code | Repository root | Plaintext | The Rexfile, helpers, and DB module — reveals security mechanisms and aids targeted attacks |
+
+#### Blast radius from a compromised admin
+
+| Impact | Scope | Details |
+|--------|-------|---------|
+| **Full SSH access to every node on every network** | All nodes, all networks | The admin's key is in every node's `authorized_keys`. The attacker can SSH to any node as the cluster user without needing passwords. |
+| **Password-based SSH access to every node** | All nodes, all networks | Decrypted passwords enable `sshpass`-based access even if key-based auth is revoked. |
+| **Impersonation of any node** | Any node-to-node path | The attacker has every node's SSH key passphrase. While the private keys are on the nodes (not the admin), the attacker can SSH to a node using the admin key, decrypt the node's passphrase store, and use the node's identity for further lateral movement. |
+| **Complete cluster topology disclosure** | Informational | CMDB YAMLs reveal all IPs, networks, and MAC addresses. The audit log reveals the full operational history. |
+| **Ability to re-bootstrap the entire cluster** | Destructive | The attacker can run `remove_ssh_keys` + `setup_ssh_keys` to rotate all keys to attacker-controlled values, permanently locking out the legitimate admin. |
+| **Encrypted DB exfiltration** | Persistent | The keyfile + DB together enable offline decryption of all secrets even after the admin is recovered. The attacker retains access to passwords and passphrases indefinitely unless they are all rotated. |
+
+#### What the attacker does NOT obtain directly from the admin
+
+| Asset | Why |
+|-------|-----|
+| **Worker nodes' private keys** | Generated on-device, never transmitted to the admin. However, the attacker can reach each node via SSH and extract them indirectly. |
+
+#### Mitigation and containment
+
+1. **Rotate everything**: All node passwords, all SSH keypairs (`--rekey=1`), the master keyfile, and the database must be regenerated from a trusted machine.
+2. **Re-image the admin node**: Assume rootkit persistence on the compromised admin.
+3. **Rotate node-local passphrase stores**: After rekeying, the old passphrase stores on worker nodes are replaced. However, if the attacker accessed worker nodes during the breach window, those nodes should also be re-imaged.
+4. **Change system-level passwords**: The passwords in `users_db.csv` are typically the OS login passwords for the cluster user. These must be changed on every node.
+5. **Review audit logs**: Check `logs/audit.log` and system auth logs on all nodes for unauthorized access during the breach window.
+
+### Summary: Comparative Blast Radius
+
+| Dimension | Worker compromise | Admin compromise |
+|-----------|-------------------|------------------|
+| Nodes reachable via SSH | All peers on the same network + admin | All nodes on all networks |
+| Passwords exposed | None | All (decryptable from DB) |
+| Key passphrases exposed | Only the compromised node's | All (decryptable from DB) |
+| Other nodes' private keys | Not directly accessible | Not directly — but reachable via SSH to each node |
+| Lateral movement difficulty | Immediate (key is pre-authorized) | Immediate (key is pre-authorized everywhere) |
+| Recovery effort | Revoke one key, rekey one node | Full cluster re-bootstrap, password rotation, potential re-imaging |
+| Fundamental limitation | Inherent to full-mesh SSH — any authorized key reaches all peers | Single point of trust — DB + keyfile co-located on one machine |
+
+### Architectural Observations
+
+1. **Full mesh = full blast radius per network**: By design, every node's key is authorized on every other node. Compromising any one node grants immediate SSH access to all peers. This is the accepted trade-off of a mesh topology. The blast radius is bounded by network — a node with only WirA access cannot reach WirB-only nodes.
+
+2. **The node-local passphrase store is security theater against root**: The `.cluster_node_keyfile` and `.cluster_node_pp` files are both owned by the same user on the same machine. A root-level attacker trivially decrypts the passphrase. The store's purpose is convenience (autonomous key loading) — not defense against local privilege escalation.
+
+3. **Admin node is a single point of catastrophic failure**: The encrypted database, keyfile, credentials, and Rex automation are all co-located. Compromising the admin is equivalent to compromising the entire cluster. Mitigations include: hardware security modules (HSM) for the keyfile, MFA for admin access, network-level isolation of the admin node, and offline/encrypted backups of the keyfile separate from the database.
+
+4. **Passwords persist after bootstrap**: Even after key-based SSH is established, the passwords remain in the encrypted DB. If the admin is compromised, these passwords enable password-based access even after all SSH keys are revoked. Consider deleting credentials from the DB after successful bootstrap (`$db->delete_credential(machine => $name)`) and relying exclusively on key-based auth.
+
+---
+
 ## TODO
 
 ### Security Improvements
@@ -482,3 +608,27 @@ rex setup_ssh_keys --network=labnet --bootstrap=1 --rekey=1
 - **Replace inline remote Perl one-liners with heredoc temp scripts**: The Perl one-liners embedded as shell-quoted strings in `remove_ssh_keys` phases 3, 6, and 7 are hard to read and impossible to test in isolation. SCP a temp Perl script to the remote node and execute it with `perl <script>`, then delete the script. This makes the logic readable and auditable.
 
 - **Consolidate CSV parsing into a shared utility**: Both `generate_cmdb.pl` and `init_cluster_db.pl` parse CSV files with nearly identical `split /\s*,\s*/, $_, 3` loops. Switching to `Text::CSV` with a shared helper would eliminate duplication and fix the comma-in-password edge case in both places simultaneously.
+
+### Blast-Radius Reduction (derived from Blast Radius Analysis)
+
+- **[HIGH] Separate keyfile from encrypted DB — break admin single-point-of-failure**: Move `.cluster_db.keyfile` off the admin node entirely (e.g. USB hardware token, HSM, or a separate vault host). The admin should fetch the key at task-run time via a challenge (PIN, MFA) and hold it only in memory. This prevents an attacker who compromises the admin filesystem from decrypting the DB offline. Implementation: add a `--keyfile-cmd` option to `ClusterSSHHelpers::init()` that executes an external command (e.g. `gpg --decrypt keyfile.gpg`) instead of reading a plaintext file.
+
+- **[HIGH] Purge passwords from DB after successful bootstrap**: Once key-based SSH is verified (via `validate_ssh_mesh`), delete plaintext credentials from `cluster_keys.db` (`$db->delete_credential(machine => $name)`). Passwords remaining in the DB after bootstrap serve no operational purpose but become a catastrophic asset if the admin is compromised. Add a `--purge-credentials` flag to `validate_ssh_mesh` that deletes credentials for all nodes that pass both key-based and password-based validation, with audit logging.
+
+- **[HIGH] Disable password authentication cluster-wide after bootstrap**: After successful key distribution, deploy `PasswordAuthentication no` to each node's `/etc/ssh/sshd_config` (or a drop-in file) and reload `sshd`. This eliminates password-based lateral movement even if the admin DB is exfiltrated. Add a new Rex task `harden_sshd` that deploys the configuration and verifies key-based access still works before committing. Requires a sudoers entry for `sshd` reload.
+
+- **[MEDIUM] Restrict admin `authorized_keys` to worker-to-admin traffic only**: Currently every worker node's key is authorized on the admin with no restrictions. Add `from="<ip-list>"` options to each key in the admin's `authorized_keys`, limiting each worker key to connections originating from that worker's known IPs. This prevents a stolen worker key from being used from an arbitrary host to reach the admin.
+
+- **[MEDIUM] Add `command=` restrictions to cross-node `authorized_keys`**: Not all nodes need arbitrary shell access to each other. For nodes that only need to perform specific operations (e.g. file transfer, job submission), prepend `command="/usr/bin/rsync --server ..."` or `command="/usr/local/bin/allowed-cmd"` to the relevant `authorized_keys` entries. This limits what an attacker can do even after obtaining a peer's key.
+
+- **[MEDIUM] Implement per-network key isolation**: Currently `setup_ssh_keys` deploys the same keypair identity across all networks. Generate a separate keypair per network per node (e.g. `id_ecdsa_p521_cluster_WirA`, `id_ecdsa_p521_cluster_WirB`). Cross-authorize only within the same network. This ensures that compromising a node on WirA does not grant access to WirB-only nodes even if the same user account is used, hardening the network boundary observed in the blast radius analysis.
+
+- **[MEDIUM] Add intrusion-detection tripwires for key material**: Deploy a cron job or systemd timer on each node that periodically checks: (1) `~/.ssh/authorized_keys` has not been modified outside of Rex (compare SHA-256 against a signed manifest), (2) `~/.ssh/id_ecdsa_p521_cluster.pub` fingerprint matches the encrypted DB record, (3) `~/.ssh/config` has not been tampered with. Report anomalies via syslog or a webhook. Add a Rex task `deploy_tripwire` that installs and configures the monitor.
+
+- **[MEDIUM] Rate-limit and alert on failed SSH attempts cluster-wide**: Configure `fail2ban` or equivalent on every node to jail IPs after repeated SSH failures. Add a Rex task `deploy_fail2ban` that installs the package (via `apt`, DISA-STIG-compliant), deploys a cluster-specific jail config targeting the cluster user, and verifies the service is active. This slows brute-force lateral movement from a compromised node.
+
+- **[LOW] Enforce key expiry and automated rotation**: Add a `--max-key-age=<days>` parameter to `validate_ssh_mesh`. For each node whose key is older than the threshold (tracked via `created_at` in the DB), emit a warning or automatically trigger `--rekey=1`. This limits the window of exposure if a key is silently compromised.
+
+- **[LOW] Encrypt CMDB YAML files at rest**: CMDB YAMLs contain IP addresses and MAC addresses — network topology that aids targeted attacks. Encrypt them with the same AES-256-GCM scheme used by ClusterDB, decrypting only at Rex runtime. Alternatively, move network data into `cluster_keys.db` alongside credentials so all sensitive data shares a single encryption boundary.
+
+- **[LOW] Add remote audit log forwarding**: Currently `logs/audit.log` exists only on the admin node. An attacker who compromises the admin can tamper with or delete it. Forward audit entries to a remote syslog server or append-only log service in real-time so that a tamper-evident copy survives admin compromise.

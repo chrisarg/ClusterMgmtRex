@@ -68,3 +68,4 @@ credentials.*
 createdatabase/cluster_keys.db
 createdatabase/.cluster_db.keyfile
 createdatabase/*.keyfile
+Rexfile.lock
