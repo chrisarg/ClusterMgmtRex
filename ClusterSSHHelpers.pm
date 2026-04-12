@@ -530,15 +530,16 @@ if ( $fp && index( $agent_keys, $fp ) >= 0 ) {
     exit 0;    # already loaded
 }
 
-# Decrypt passphrase into a 0400 temp file
+# Decrypt passphrase into a temp file (0600 for write, then 0400)
 my ( $pp_fh, $pp_file ) =
   tempfile( '.cl_XXXXXXXX', DIR => '/tmp', UNLINK => 1 );
 close $pp_fh;
-chmod 0400, $pp_file;
+chmod 0600, $pp_file;
 
 my $rc = system( 'openssl', 'enc', '-d', '-aes-256-cbc', '-pbkdf2',
     '-iter', '600000', '-pass', "file:$keyfile",
     '-in', $enc_pp, '-out', $pp_file );
+chmod 0400, $pp_file;
 if ( $rc != 0 ) {
     unlink $pp_file;
     die "Failed to decrypt cluster key passphrase\n";
