@@ -1,0 +1,70 @@
+# Repository-level ignore policy
+
+# Sensitive source data
+system_db_setup/*.csv
+
+# Generated/managed machine inventory
+cmdb/*.yml
+cmdb/*.yaml
+
+# Audit and runtime logs
+logs/
+*.log
+**/audit.log
+
+# Databases and local state
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.mdb
+*.accdb
+*.sqlitedb
+
+# Keyfiles, private keys, and certificates
+*.key
+*.keyfile
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.csr
+*.crt
+*.cer
+*.der
+
+# SSH sensitive material
+**/id_*
+!**/id_*.pub
+**/authorized_keys
+**/known_hosts
+
+# Env and secret config files
+.env
+.env.*
+*.env
+*.secret
+*.secrets
+secrets.*
+credentials.*
+
+# Backups, dumps, and exports that may contain secrets
+*.bak
+*.backup
+*.old
+*.tmp
+*.swp
+*.dump
+*.sql
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+
+# Project-specific sensitive artifacts
+createdatabase/cluster_keys.db
+createdatabase/.cluster_db.keyfile
+createdatabase/*.keyfile

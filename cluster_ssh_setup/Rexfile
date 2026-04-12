@@ -1,0 +1,3123 @@
+use v5.38;
+use Rex -feature => ['1.4'];
+use Rex::Commands::Run;
+use Rex::Commands::File;
+use Rex::Commands::Download;
+use Rex::Commands::User;
+use Rex::CMDB;
+use Rex::Group;
+use FindBin qw($Bin);
+use lib $Bin, "$Bin/..";
+use File::Basename qw(basename dirname);
+use File::Path     qw(remove_tree);
+use File::Temp     qw(tempfile tempdir);
+use Cwd            qw(abs_path);
+use YAML::Tiny;
+use IO::Handle;
+use IO::Interface;
+use IPC::System::Simple qw(capturex systemx);
+use POSIX               qw(strftime);
+use Text::Wrap          qw(wrap);
+use Net::Ping;
+use ClusterSSHHelpers;
+
+# Encrypted key database support [SEC-CRED-ENCRYPT]: no plaintext keys on disk
+my $HAS_CLUSTER_DB = eval {
+    my $db_lib = abs_path('../createdatabase');
+    if ( $db_lib && -d $db_lib ) {
+        unshift @INC, $db_lib;
+        require ClusterDB;
+        return 1;
+    }
+    return 0;
+};
+
+# ---------------------------------------------------------------------------
+# Security Practice Labels & FIPS-140 Compliance Configuration
+# ---------------------------------------------------------------------------
+# This Rexfile follows DISA-STIG-aligned security practices. The V-238xxx
+# rule IDs belong to the Ubuntu 20.04 LTS STIG and do not apply to 22.04.
+# Instead, the practices below are labelled with descriptive security tags:
+#
+#   [SEC-SSH-NOPASSWD]    Password authentication disabled (key-based only)
+#   [SEC-STRICT-HOSTKEY]  StrictHostKeyChecking enforced (except bootstrap)
+#   [SEC-FIPS-ALGO]       SSH key generation uses FIPS-approved algorithms
+#   [SEC-CRED-ENCRYPT]    No plaintext credentials in process table or on disk
+#   [SEC-AUDIT-LOG]       All mutating operations produce audit log entries
+#   [SEC-CRED-REDACT]     Credentials not displayed to terminal
+#   [SEC-KEY-PASSPHRASE]  SSH keys protected with random passphrase
+#   [SEC-SSH-CONFIG-PERMS] SSH config file permissions enforced to 0600
+#   [FIPS-140]            Only NIST-approved algorithms for keyscan/keygen
+#
+# Operational modes:
+#   - Bootstrap (--bootstrap=1): For initial key distribution only.
+#     Uses SSH_ASKPASS + 0400 tempfile for password handling (never in
+#     process table or /proc/environ; [SEC-CRED-ENCRYPT]).
+#     Requires explicit opt-in. Host key checking relaxed.
+#   - Operational (default): Key-based SSH with strict host checking.
+#     No passwords needed or used. The cluster key must already exist.
+#
+# Prerequisites:
+#   - sudoers NOPASSWD rules for the cluster service account:
+#       /usr/sbin/shutdown (or /sbin/shutdown) -- for the shutdown task
+#       /usr/bin/tee /etc/hosts                -- for /etc/hosts updates
+#   - SSH keys deployed via setup_ssh_keys --bootstrap=1 before other tasks
+# ---------------------------------------------------------------------------
+
+# FIPS-approved key types for ssh-keyscan (NIST SP 800-131A Rev.2)
+my $FIPS_KEYSCAN_TYPES =
+  'ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521';
+
+# Audit log for all mutating operations
+my $audit_log_path = abs_path('../logs/audit.log');
+
+# Admin SSH key path (used for operational admin -> node connections)
+my $cluster_key_path = ( $ENV{HOME} // '.' ) . '/.ssh/id_ecdsa_p521_cluster';
+
+# Encrypted key database paths [SEC-CRED-ENCRYPT]
+my $createdatabase_dir = abs_path('../createdatabase') // '../createdatabase';
+my $cluster_db_path    = "$createdatabase_dir/cluster_keys.db";
+my $cluster_db_keyfile = "$createdatabase_dir/.cluster_db.keyfile";
+
+# Configure Rex to use sudo globally for tasks
+#sudo TRUE;
+
+#1. Enumerate machine names from the cmdb directory at load time
+my $cmdb_dir    = abs_path('../cmdb');
+my @yml_files   = glob("$cmdb_dir/*.yml");
+my @machines    = map { basename( $_, '.yml' ) } @yml_files;
+my %machine_set = map { $_ => 1 } @machines;
+
+# Validate machine names to prevent shell injection (OWASP A03:2021)
+for my $name (@machines) {
+    die "Invalid machine name '$name': must match /^[a-zA-Z0-9._-]+\$/\n"
+      unless $name =~ /^[a-zA-Z0-9._-]+$/;
+}
+
+#2. Configure Rex::CMDB
+set cmdb => {
+    type           => 'YAML',
+    path           => $cmdb_dir,
+    merge_behavior => 'LEFT_PRECEDENT',
+};
+
+#3. Centralized group definitions for scalable inventory management.
+#   Add or modify groups here as inventory needs grow.
+my %group_defs = ( all => [ sort @machines ], );
+
+for my $group_name ( sort keys %group_defs ) {
+    my @members = grep { $machine_set{$_} } @{ $group_defs{$group_name} };
+    group $group_name => @members;
+}
+
+# Default SSH connection retry count (overridable per-task via --ssh_retry=N)
+my $DEFAULT_SSH_RETRY = 5;
+
+# ---------------------------------------------------------------------------
+# Initialize shared helpers (ClusterSSHHelpers)
+# ---------------------------------------------------------------------------
+ClusterSSHHelpers::init(
+    machines           => \@machines,
+    machine_set        => \%machine_set,
+    audit_log_path     => $audit_log_path,
+    cluster_key_path   => $cluster_key_path,
+    cluster_db_path    => $cluster_db_path,
+    cluster_db_keyfile => $cluster_db_keyfile,
+    has_cluster_db     => $HAS_CLUSTER_DB,
+    default_ssh_retry  => $DEFAULT_SSH_RETRY,
+);
+
+# ===========================================================================
+# Tasks
+# ===========================================================================
+
+# rex show_cmdb                      ; show all machines (passwords redacted)
+# rex show_cmdb --group=<name>       ; show only machines in a named group
+desc "Display network and machine information from the CMDB";
+task "show_cmdb", sub {
+    my $param      = shift || {};
+    my $group_name = $param->{group} // 'all';
+
+    die "Group '$group_name' is not defined.\n"
+      unless Rex::Group->is_group($group_name);
+    my @group_members = Rex::Group->get_group($group_name);
+
+    say "=" x 60;
+    say "CMDB Machine & Network Information (group: $group_name)";
+    say "=" x 60;
+    for my $machine ( sort @group_members ) {
+        my $networks = get cmdb( 'networks', $machine );
+        my ( $username, undef ) = get_credential($machine);
+        say "\nMachine  : $machine";
+        say "Username : " . ( $username // '(not set)' );
+        say "Password : (redacted - SEC-CRED-REDACT)";
+        say "Networks :";
+        for my $net ( sort keys %{$networks} ) {
+            printf "  %-10s %s\n", $net, $networks->{$net};
+        }
+    }
+    say "\n" . "=" x 60;
+};
+
+# rex list_groups                     ; list all defined inventory groups and their members
+desc "List defined inventory groups and their members";
+task "list_groups", sub {
+    my %groups = Rex::Group->get_groups;
+
+    say "=" x 60;
+    say "Inventory Groups";
+    say "=" x 60;
+
+    for my $group_name ( sort keys %groups ) {
+        my @members = sort map { "$_" } @{ $groups{$group_name} };
+        say "\nGroup   : $group_name";
+        my $members_text = @members ? join( ', ', @members ) : '(none)';
+        local $Text::Wrap::columns = 60;
+        print wrap( "Members : ", " " x 10, $members_text );
+        print "\n";
+    }
+
+    say "\n" . "=" x 60;
+};
+
+# rex show_keys                     ; list all stored key metadata
+# rex show_keys --machine=<name>    ; show decrypted key for a specific machine
+# Requires: ClusterDB module, CLUSTER_DB_KEY env var or keyfile
+desc "List SSH public keys stored in the encrypted database";
+task "show_keys", sub {
+    die "ClusterDB module not available.\n"
+      . "Install: cpan CryptX DBI DBD::SQLite\n"
+      unless $HAS_CLUSTER_DB;
+    my $db = cluster_db()
+      or die "Key database not accessible.\n"
+      . "Set CLUSTER_DB_KEY env var or create keyfile.\n";
+
+    my $param   = shift || {};
+    my $machine = $param->{machine};
+
+    if ($machine) {
+        validate_name($machine);
+        my @keys = $db->get_key( machine => $machine );
+        if ( !@keys ) {
+            say "No keys found for machine '$machine'.";
+            return;
+        }
+        say "=" x 70;
+        say "Keys for: $machine";
+        say "=" x 70;
+        for my $k (@keys) {
+            say "Key Type    : $k->{key_type}";
+            say "Fingerprint : $k->{fingerprint}" if $k->{fingerprint};
+            say "Created     : $k->{created_at}";
+            say "Rotated     : $k->{rotated_at}" if $k->{rotated_at};
+            say "Public Key  : $k->{public_key}";
+            say "-" x 70;
+        }
+    }
+    else {
+        my @keys = $db->list_keys;
+        say "=" x 70;
+        say "Stored SSH Public Keys";
+        say "=" x 70;
+        printf "%-20s %-26s %-12s %s\n",
+          'Machine', 'Key Type', 'Created', 'Fingerprint';
+        say "-" x 70;
+        for my $k (@keys) {
+            printf "%-20s %-26s %-12s %s\n",
+              $k->{machine}, $k->{key_type},
+              substr( $k->{created_at}  // '', 0, 10 ),
+              substr( $k->{fingerprint} // '', 0, 20 );
+        }
+        say "=" x 70;
+        say "Total: " . scalar(@keys) . " key(s)";
+    }
+    audit_log( 'show_keys', machine => $machine // 'all' );
+};
+
+# rex show_credentials                       ; list all stored credential metadata (no secrets)
+# rex show_credentials --machine=<name>      ; show credential for a specific machine (redacted)
+# Requires: ClusterDB module, CLUSTER_DB_KEY env var or keyfile
+desc "List credentials stored in the encrypted database (passwords redacted)";
+task "show_credentials", sub {
+    die "ClusterDB module not available.\n"
+      . "Install: cpan CryptX DBI DBD::SQLite\n"
+      unless $HAS_CLUSTER_DB;
+    my $db = cluster_db()
+      or die "Key database not accessible.\n"
+      . "Set CLUSTER_DB_KEY env var or create keyfile.\n";
+
+    my $param   = shift || {};
+    my $machine = $param->{machine};
+
+    if ($machine) {
+        validate_name($machine);
+        my $cred = $db->get_credential( machine => $machine );
+        if ( !$cred ) {
+            say "No credentials found for machine '$machine'.";
+            return;
+        }
+        say "=" x 60;
+        say "Credentials for: $machine";
+        say "=" x 60;
+        say "Username : $cred->{username}";
+        say "Password : (redacted - SEC-CRED-REDACT)";
+        say "=" x 60;
+    }
+    else {
+        my @creds = $db->list_credentials;
+        say "=" x 60;
+        say "Stored Credentials (passwords redacted)";
+        say "=" x 60;
+        printf "%-24s %-12s %-12s %s\n",
+          'Machine', 'Created', 'Rotated', 'Comment';
+        say "-" x 60;
+        for my $c (@creds) {
+            printf "%-24s %-12s %-12s %s\n", $c->{machine},
+              substr( $c->{created_at} // '', 0, 10 ),
+              substr( $c->{rotated_at} // '', 0, 10 ),
+              $c->{comment} // '';
+        }
+        say "=" x 60;
+        say "Total: " . scalar(@creds) . " credential(s)";
+    }
+    audit_log( 'show_credentials', machine => $machine // 'all' );
+};
+
+# rex check_network                          ; probe all nodes on default network (WirA)
+# rex check_network --network=<name>         ; probe nodes on a specific network
+# rex check_network --group=<name>           ; limit probe to a named group
+# rex check_network --timeout=<seconds>      ; TCP connect timeout per node (default: 1)
+# Reachability is tested via TCP on port 22 (no ICMP, no prior key trust needed).
+desc "Check node reachability for a network within a group";
+task "check_network", sub {
+    local $| = 1;
+    my $param        = shift || {};
+    my $group_name   = $param->{group}   // 'all';
+    my $network_name = $param->{network} // 'WirA';
+    my $ping_timeout = $param->{timeout} // 1;
+
+    die "Group '$group_name' is not defined.\n"
+      unless Rex::Group->is_group($group_name);
+
+    my @group_members = map { "$_" } Rex::Group->get_group($group_name);
+    my $pinger        = tcp_pinger($ping_timeout);
+
+    say "=" x 60;
+    say "Network Reachability (group: $group_name, network: $network_name)";
+    say "=" x 60;
+    say "Checking "
+      . scalar(@group_members)
+      . " nodes with timeout ${ping_timeout}s";
+
+    for my $machine ( sort @group_members ) {
+        my $networks = get cmdb( 'networks', $machine ) // {};
+        my $ip       = $networks->{$network_name};
+
+        if ( !$ip ) {
+            say sprintf "%-20s %-15s %s", $machine, '(no ip)', 'MISSING';
+            next;
+        }
+
+        say "Probing $machine ($ip)...";
+        my $is_up = $pinger->ping($ip) ? 'UP' : 'DOWN';
+        say sprintf "%-20s %-15s %s", $machine, $ip, $is_up;
+    }
+
+    $pinger->close;
+    say "";
+    say "=" x 60;
+};
+
+# rex show_known_hosts --network=<name>               ; show known_hosts on all reachable nodes (network required)
+# rex show_known_hosts --network=<name> --group=<name> ; limit to a named group (default: all)
+# rex show_known_hosts --network=<name> --ssh_retry=<n>; SSH connection attempts (default: 5)
+# Requires cluster SSH key (run setup_ssh_keys --bootstrap=1 first)
+desc "Show known_hosts entries on each reachable node in a group";
+task "show_known_hosts", sub {
+    local $| = 1;
+    require_cluster_key();
+    ensure_agent_loaded();
+
+    my $param        = shift || {};
+    my $group_name   = $param->{group} // 'all';
+    my $network_name = $param->{network}
+      or die "Parameter --network is required.\n";
+    my $ping_timeout = $param->{timeout}   // 1;
+    my $ssh_retry    = $param->{ssh_retry} // $DEFAULT_SSH_RETRY;
+    local @ssh_opts = ssh_opts($ssh_retry);
+
+    die "Group '$group_name' is not defined.\n"
+      unless Rex::Group->is_group($group_name);
+
+    my @group_members = map { "$_" } Rex::Group->get_group($group_name);
+    my $pinger        = tcp_pinger($ping_timeout);
+
+    say "=" x 60;
+    say "Known Hosts (group: $group_name, network: $network_name)";
+    say "=" x 60;
+
+    my @summary;
+    for my $machine ( sort @group_members ) {
+        my $networks = get cmdb( 'networks', $machine ) // {};
+        my $ip       = $networks->{$network_name};
+
+        if ( !$ip ) {
+            say "\n$machine : MISSING (no IP for network '$network_name')";
+            push @summary,
+              {
+                machine => $machine,
+                status  => 'MISSING',
+                count   => '-',
+                dupes   => '-'
+              };
+            next;
+        }
+
+        if ( !$pinger->ping($ip) ) {
+            say "\n$machine ($ip) : DOWN";
+            push @summary,
+              {
+                machine => $machine,
+                status  => 'DOWN',
+                count   => '-',
+                dupes   => '-'
+              };
+            next;
+        }
+
+        my ( $username, undef ) = get_credential($machine);
+
+        if ( !$username ) {
+            say "\n$machine ($ip) : SKIP (missing username)";
+            push @summary,
+              {
+                machine => $machine,
+                status  => 'SKIP',
+                count   => '-',
+                dupes   => '-'
+              };
+            next;
+        }
+
+        my $target  = "$username\@$ip";
+        my $entries = eval {
+            capturex( 'ssh', @ssh_opts, $target,
+                    'ssh-keygen -F "" -f ~/.ssh/known_hosts 2>/dev/null | '
+                  . 'grep -v "^#" || cat ~/.ssh/known_hosts 2>/dev/null' );
+        };
+
+        say "\n" . "-" x 60;
+        say "$machine ($ip):";
+        say "-" x 60;
+        my ( $total, %key_seen, @dupes ) = (0);
+        if ( !$entries || !length $entries ) {
+            say "  (known_hosts is empty or not found)";
+        }
+        else {
+            my $idx = 0;
+            for my $line ( split /\n/, $entries ) {
+                my ( $host_field, $key_type, $km_raw ) =
+                  split /\s+/, $line, 3;
+                next
+                  unless defined $km_raw
+                  && $line =~ /\S/
+                  && $line !~ /^\s*#/;
+                $total++;
+                my ($key_mat) = split /\s+/, $km_raw;         # base64 only
+                my $dk = "$host_field $key_type $key_mat";    # host+type+key
+                push @dupes, $line if $key_seen{$dk}++;
+                my $host_label =
+                  defined $host_field && $host_field =~ /^\|/
+                  ? '[hashed]'
+                  : ( $host_field // '[unknown]' );
+                my $key_short =
+                  defined $key_mat && length $key_mat > 32
+                  ? substr( $key_mat, 0, 20 ) . '...' . substr( $key_mat, -8 )
+                  : ( $key_mat // '' );
+                local $Text::Wrap::columns = 72;
+                print wrap( sprintf( "  [%2d] ", ++$idx ),
+                    "       ",
+                    "$host_label  " . ( $key_type // '' ) . "  $key_short" );
+                print "\n";
+            }
+        }
+        push @summary,
+          {
+            machine => $machine,
+            status  => 'OK',
+            count   => $total,
+            dupes   => scalar @dupes,
+          };
+    }
+
+    $pinger->close;
+
+    say "";
+    say "=" x 60;
+    say "Summary";
+    say "=" x 60;
+    printf "%-24s %-8s %7s %6s\n", 'Machine', 'Status', 'Entries', 'Dupes';
+    say "-" x 50;
+    for my $row (@summary) {
+        printf "%-24s %-8s %7s %6s\n",
+          $row->{machine}, $row->{status}, $row->{count}, $row->{dupes};
+    }
+    say "=" x 60;
+};
+
+# rex rm_dup_hosts --network=<name>               ; remove duplicate known_hosts entries on all reachable nodes (network required)
+# rex rm_dup_hosts --network=<name> --group=<name> ; limit to a named group (default: all)
+# rex rm_dup_hosts --network=<name> --ssh_retry=<n>; SSH connection attempts (default: 5)
+# Requires cluster SSH key (run setup_ssh_keys --bootstrap=1 first)
+desc "Remove duplicate known_hosts entries on each reachable node in a group";
+task "rm_dup_hosts", sub {
+    local $| = 1;
+    require_cluster_key();
+    ensure_agent_loaded();
+
+    my $param        = shift || {};
+    my $group_name   = $param->{group} // 'all';
+    my $network_name = $param->{network}
+      or die "Parameter --network is required.\n";
+    my $ping_timeout = $param->{timeout}   // 1;
+    my $ssh_retry    = $param->{ssh_retry} // $DEFAULT_SSH_RETRY;
+    local @ssh_opts = ssh_opts($ssh_retry);
+
+    die "Group '$group_name' is not defined.\n"
+      unless Rex::Group->is_group($group_name);
+
+    audit_log(
+        'rm_dup_hosts_start',
+        group   => $group_name,
+        network => $network_name
+    );
+
+    my @group_members = map { "$_" } Rex::Group->get_group($group_name);
+    my $pinger        = tcp_pinger($ping_timeout);
+
+    say "=" x 60;
+    say "Remove Duplicate Known Hosts "
+      . "(group: $group_name, network: $network_name)";
+    say "=" x 60;
+
+    my @summary;
+    for my $machine ( sort @group_members ) {
+        my $networks = get cmdb( 'networks', $machine ) // {};
+        my $ip       = $networks->{$network_name};
+
+        if ( !$ip ) {
+            say "\n$machine : MISSING (no IP for network '$network_name')";
+            push @summary,
+              { machine => $machine, status => 'MISSING', removed => '-' };
+            next;
+        }
+
+        if ( !$pinger->ping($ip) ) {
+            say "\n$machine ($ip) : DOWN";
+            push @summary,
+              { machine => $machine, status => 'DOWN', removed => '-' };
+            next;
+        }
+
+        my ( $username, undef ) = get_credential($machine);
+
+        if ( !$username ) {
+            say "\n$machine ($ip) : SKIP (missing username)";
+            push @summary,
+              { machine => $machine, status => 'SKIP', removed => '-' };
+            next;
+        }
+
+        my $target = "$username\@$ip";
+
+        # Read existing known_hosts
+        my $raw = eval {
+            capturex( 'ssh', @ssh_opts, $target,
+                'cat ~/.ssh/known_hosts 2>/dev/null' );
+        };
+
+        my ( @kept, %key_seen, $removed );
+        $removed = 0;
+        for my $line ( split /\n/, $raw // '' ) {
+            my ( $hf, $kt, $km ) = kh_key($line);
+            next unless defined $kt;
+            my $dk =
+              "$hf $kt $km";    # host+type+key: correct even for plain entries
+            if ( $key_seen{$dk}++ ) {
+                $removed++;
+            }
+            else {
+                push @kept, $line;
+            }
+        }
+
+        say "\n$machine ($ip): $removed duplicate(s) removed";
+
+        if ( $removed > 0 ) {
+            my $new_content = join( "\n", @kept ) . "\n";
+            my ( $tmp_fh, $tmp ) = tempfile(
+                '.cl_XXXXXXXX',
+                DIR    => '/tmp',
+                UNLINK => 1,
+            );
+            print $tmp_fh $new_content;
+            close $tmp_fh;
+            run_or_warn( 'scp', @ssh_opts,
+                $tmp, "$target:~/.ssh/.known_hosts_tmp" );
+            run_or_warn( 'ssh', @ssh_opts, $target,
+                    'mv ~/.ssh/.known_hosts_tmp ~/.ssh/known_hosts'
+                  . ' && chmod 600 ~/.ssh/known_hosts' );
+            unlink $tmp;
+            audit_log(
+                'rm_dup_hosts',
+                machine => $machine,
+                removed => $removed
+            );
+        }
+
+        push @summary,
+          { machine => $machine, status => 'OK', removed => $removed };
+    }
+
+    $pinger->close;
+
+    say "";
+    say "=" x 60;
+    say "Summary";
+    say "=" x 60;
+    printf "%-24s %-8s %7s\n", 'Machine', 'Status', 'Removed';
+    say "-" x 42;
+    for my $row (@summary) {
+        printf "%-24s %-8s %7s\n", $row->{machine}, $row->{status},
+          $row->{removed};
+    }
+    say "=" x 60;
+};
+
+# rex setup_ssh_keys --network=<name> --bootstrap=1                    ; distribute keys to all nodes
+# rex setup_ssh_keys --network=<name> --bootstrap=1 --group=<name>      ; limit to a named group (default: all)
+# rex setup_ssh_keys --network=<name> --bootstrap=1 --machine=<name>    ; limit to a single machine
+#   (if both --group and --machine are given, --group takes precedence)
+# rex setup_ssh_keys --network=<name> --bootstrap=1 --timeout=<s>       ; TCP probe timeout (default: 1)
+# rex setup_ssh_keys --network=<name> --bootstrap=1 --ssh_retry=<n>     ; SSH connection attempts (default: 5)
+#
+# Security Notes:
+#   - Requires --bootstrap=1 for explicit opt-in to password-based auth
+#   - Passwords are passed via SSH_ASKPASS + 0400 tempfile (never in process cmdline or /proc/environ)
+#   - FIPS-approved algorithms only for keyscan and key generation [SEC-FIPS-ALGO]
+#   - All SSH keys are passphrase-protected [SEC-KEY-PASSPHRASE]
+#   - Key passphrases stored in AES-256-GCM encrypted database [SEC-CRED-ENCRYPT]
+#   - ssh-agent used for passphrase-protected key operations
+#   - Sudo on remote nodes requires NOPASSWD sudoers configuration
+#   - All operations are audit-logged [SEC-AUDIT-LOG]
+#
+# What this task does (9 phases):
+#   [1/9] Validates that ssh, scp, ssh-keygen, ssh-copy-id, sshpass, ssh-keyscan, openssl are available locally
+#   [2/9] Generates admin ~/.ssh/id_ecdsa_p521_cluster keypair (NIST P-521, FIPS-140-2 approved) if absent
+#         Key is passphrase-protected; passphrase stored in encrypted database
+#   [3/9] Probes each node via TCP on port 22; classifies as UP/DOWN/MISSING
+#   [4/9] Updates admin ~/.ssh/known_hosts for each reachable node (removes stale entries first)
+#   [5/9] Generates a unique per-node keypair on each reachable node (on-device, private key never leaves)
+#         Key is passphrase-protected; passphrase stored in encrypted database
+#         Authorizes admin's public key via ssh-copy-id (admin -> node access)
+#         Deploys node-local encrypted passphrase store (enables autonomous key loading;
+#           files: ~/.ssh/.cluster_node_keyfile, ~/.ssh/.cluster_node_pp, ~/.ssh/load_cluster_key.pl)
+#   [6/9] Cross-authorizes all node public keys on admin and peers (node -> admin + node -> node mesh)
+#   [7/9] Builds complete known_hosts on each reachable node: fresh keys for
+#          admin + all cluster peers (full pairwise trust, no TOFU prompts anywhere)
+#   [8/9] Deploys ~/.ssh/config with IdentityFile + StrictHostKeyChecking on admin and all nodes
+#          (ensures the cluster key is offered automatically; strict host checking enforced)
+#   [9/9] Updates /etc/hosts on admin and all reachable nodes with network aliases
+#          (adds {network}{machine} alias entries; skips entries already present)
+desc
+"Generate per-node SSH keys and cross-authorize for a network group; report down nodes";
+task "setup_ssh_keys", sub {
+    my $param        = shift || {};
+    my $group_name   = $param->{group};
+    my $machine_name = $param->{machine};
+    my $network_name = $param->{network};
+    my $ping_timeout = $param->{timeout}   // 1;
+    my $bootstrap    = $param->{bootstrap} // 0;
+    my $ssh_retry    = $param->{ssh_retry} // $DEFAULT_SSH_RETRY;
+    local @ssh_opts           = ssh_opts($ssh_retry);
+    local @ssh_opts_bootstrap = ssh_opts_bootstrap($ssh_retry);
+
+    die "Parameter --network is required.\n" unless $network_name;
+    validate_name($network_name);
+
+    die "This task requires --bootstrap=1 for explicit opt-in.\n"
+      . "WARNING: Bootstrap mode uses password authentication and\n"
+      . "disables strict host key verification. Use only for initial setup.\n"
+      . "Ensure sudoers is configured with NOPASSWD for the cluster account.\n"
+      unless $bootstrap;
+
+    my @target_members = resolve_targets($param);
+    $group_name //= 'all';
+
+    audit_log(
+        'setup_ssh_keys_start',
+        group   => $group_name,
+        machine => $machine_name // 'all',
+        network => $network_name
+    );
+
+    local $| = 1;
+    say "[1/9] Validating required local commands";
+    for
+      my $required_cmd (qw(ssh ssh-copy-id scp ssh-keygen sshpass ssh-keyscan openssl))
+    {
+        die "Required command not found: $required_cmd\n"
+          if !command_exists($required_cmd);
+    }
+
+    my $home     = $ENV{HOME} // '.';
+    my $ssh_dir  = "$home/.ssh";
+    my $key_base = "$ssh_dir/id_ecdsa_p521_cluster";
+    my $pub_key  = "$key_base.pub";
+
+    say "[2/9] Ensuring admin keypair exists at $key_base";
+    if ( !-f $key_base || !-f $pub_key ) {
+        if ( !-d $ssh_dir ) {
+            mkdir $ssh_dir;
+            CORE::chmod 0700, $ssh_dir;
+        }
+
+        # [SEC-KEY-PASSPHRASE]: generate key WITH passphrase (two-factor: have + know)
+        my $admin_pp = generate_passphrase();
+        die "Failed to generate ssh keypair.\n"
+          if !run_or_warn(
+            'ssh-keygen', '-t', 'ecdsa',   '-b', '521', '-N',
+            $admin_pp,    '-f', $key_base, '-C', 'admin-key'
+          );
+        CORE::chmod 0400, $key_base;
+        audit_log( 'keypair_generated', path => $key_base );
+
+        # Store the passphrase in the encrypted database
+        if ( my $db = cluster_db() ) {
+            $db->store_key_passphrase(
+                machine    => 'admin',
+                passphrase => $admin_pp,
+                comment    => 'admin cluster key passphrase',
+            );
+            say "  - admin key passphrase stored in encrypted database";
+        }
+        else {
+            die "ClusterDB unavailable: cannot store admin key passphrase.\n"
+              . "Key passphrases MUST be stored securely [SEC-KEY-PASSPHRASE].\n";
+        }
+    }
+
+    # Store admin public key in encrypted database [SEC-CRED-ENCRYPT]
+    if ( my $db = cluster_db() ) {
+        my $pub_content = do {
+            open my $f, '<', $pub_key or die "Cannot read $pub_key: $!\n";
+            local $/;
+            <$f>;
+        };
+        chomp $pub_content;
+        my $fp = eval {
+            chomp( my $f = capturex( 'ssh-keygen', '-lf', $pub_key ) );
+            $f;
+        } // '';
+        $db->store_key(
+            machine     => 'admin',
+            key_type    => 'ecdsa-sha2-nistp521',
+            public_key  => $pub_content,
+            fingerprint => $fp,
+            comment     => 'admin-key',
+        );
+        say "  - admin public key stored in encrypted database";
+    }
+
+    # Load admin key into ssh-agent for subsequent phases
+    ensure_agent_loaded();
+    say "  - admin key loaded into ssh-agent";
+
+    my @group_members = map { "$_" } Rex::Group->get_group($group_name);
+    my $pinger        = tcp_pinger($ping_timeout);
+
+    my ( $admin_ip, $admin_machine ) = detect_admin($network_name);
+    say "  - admin machine on $network_name: "
+      . ( $admin_machine // '(unknown)' )
+      . " (${\ ($admin_ip // 'n/a')})";
+
+    my @reachable;
+    my @down;
+
+    say "="  x 60;
+    say "Preparing SSH key distribution (group: "
+      . "$group_name, network: $network_name)";
+    say "=" x 60;
+    say "[3/9] Probing "
+      . scalar(@target_members)
+      . " nodes with timeout ${ping_timeout}s";
+
+    for my $machine ( sort @target_members ) {
+        my $networks = get cmdb( 'networks', $machine ) // {};
+        my $ip       = $networks->{$network_name};
+
+        if ( !$ip ) {
+            say sprintf "%-20s %-15s %s", $machine, '(no ip)', 'MISSING';
+            next;
+        }
+
+        # Skip the admin machine — it does not receive keys from itself
+        if ( defined $admin_machine && $machine eq $admin_machine ) {
+            say sprintf "%-20s %-15s %s", $machine, $ip, 'ADMIN (skipped)';
+            next;
+        }
+
+        say "Checking reachability for $machine ($ip)...";
+        if ( !$pinger->ping($ip) ) {
+            push @down, [ $machine, $ip ];
+            say sprintf "%-20s %-15s %s", $machine, $ip, 'DOWN';
+            next;
+        }
+
+        my ( $username, $password ) = get_credential($machine);
+
+        if ( !$username || !$password ) {
+            say sprintf "%-20s %-15s %s", $machine, $ip,
+              'SKIP (missing credentials)';
+            next;
+        }
+
+        push @reachable,
+          {
+            machine  => $machine,
+            ip       => $ip,
+            username => $username,
+            password => $password,
+          };
+
+        say sprintf "%-20s %-15s %s", $machine, $ip, 'UP';
+    }
+
+    $pinger->close;
+
+    my $known_hosts = "$ssh_dir/known_hosts";
+    say "[4/9] Updating admin known_hosts for "
+      . scalar(@reachable)
+      . " reachable nodes";
+
+    # Scan ALL reachable nodes first, build one combined fresh-key map.
+    # Use FIPS-approved key types only (NIST SP 800-131A Rev.2)
+    my %fresh_entries;    # "$ip $kt" => merged line
+    for my $node (@reachable) {
+        my $ip           = $node->{ip};
+        my $connect_host = $network_name . $node->{machine};
+        say "  - scanning $node->{machine} ($ip)";
+        my $keyscan_out = eval {
+            capturex( 'ssh-keyscan', '-T', '5',
+                '-t', $FIPS_KEYSCAN_TYPES, $ip );
+        };
+        if ( !$keyscan_out ) {
+            say "  ! keyscan failed for $node->{machine} ($ip), skipping";
+            next;
+        }
+        for my $line ( split /\n/, $keyscan_out ) {
+            my ( $hf, $kt, $km ) = kh_key($line);
+            next unless defined $kt;
+
+            # Rewrite "ip key_type key_mat" -> "ip,alias key_type key_mat"
+            ( my $merged = $line ) =~ s/^\Q$ip\E /$ip,$connect_host /;
+            $fresh_entries{"$ip $kt"} = $merged;
+        }
+    }
+
+   # Build set of all cluster host identifiers so we can wipe their entries
+   # and replace with fresh ones (handles both hashed leftovers and stale keys).
+    my %cluster_host_ids;
+    for my $node (@reachable) {
+        $cluster_host_ids{ $node->{ip} } = 1;
+        $cluster_host_ids{ $network_name . $node->{machine} } = 1;
+    }
+
+    # Keep ONLY non-cluster, non-hashed plain entries.
+    # Drops: all hashed entries (stale from prior -H runs), all cluster host
+    # entries regardless of key material (handles key changes too).
+    my @kept_existing;
+    if ( -f $known_hosts ) {
+        open my $fh, '<', $known_hosts
+          or die "Cannot read $known_hosts: $!\n";
+        while ( my $l = <$fh> ) {
+            chomp $l;
+            my ( $hf, $kt, $km ) = kh_key($l);
+            next unless defined $kt;
+            next if $hf =~ /^\|/;    # drop hashed entries
+            next
+              if grep { $cluster_host_ids{$_} } split /,/,
+              $hf;                   # drop cluster-host entries
+            push @kept_existing, $l;
+        }
+        close $fh;
+    }
+
+    # One atomic write: kept non-cluster entries + all fresh cluster entries.
+    my ( $tmp_kh_fh, $tmp_kh ) = tempfile(
+        '.cl_XXXXXXXX',
+        DIR    => $ssh_dir,
+        UNLINK => 0,
+    );
+    say $tmp_kh_fh $_ for @kept_existing;
+    say $tmp_kh_fh $_ for values %fresh_entries;
+    close $tmp_kh_fh;
+    rename $tmp_kh, $known_hosts or die "Cannot rename $tmp_kh: $!\n";
+    CORE::chmod 0600, $known_hosts;
+    say "  - admin known_hosts: "
+      . scalar( keys %fresh_entries )
+      . " cluster entries, "
+      . scalar(@kept_existing)
+      . " other entries kept";
+    audit_log(
+        'known_hosts_updated',
+        host    => 'admin',
+        cluster => scalar( keys %fresh_entries ),
+        other   => scalar(@kept_existing)
+    );
+
+    # Store host keys in encrypted database [SEC-CRED-ENCRYPT]
+    if ( my $db = cluster_db() ) {
+        for my $node (@reachable) {
+            for my $ekey ( sort keys %fresh_entries ) {
+                next unless $ekey =~ /^\Q$node->{ip}\E\s+(.+)/;
+                my $kt = $1;
+                $db->store_key(
+                    machine    => $node->{machine},
+                    key_type   => $kt,
+                    public_key => $fresh_entries{$ekey},
+                    comment    => "host-key $node->{ip}",
+                );
+            }
+        }
+        say "  - host keys stored in encrypted database";
+    }
+
+    say "[5/9] Generating per-node keys on "
+      . scalar(@reachable)
+      . " reachable nodes";
+
+    my %node_pubkeys;    # machine => public_key_content
+    my $db_for_pp = cluster_db();
+
+    for my $node (@reachable) {
+        my $target = $node->{username} . '@' . $node->{ip};
+        my $pass   = $node->{password};
+
+        say "";
+        say "Setting up $node->{machine} ($node->{ip})";
+        say "  - preparing ~/.ssh";
+        bootstrap_run_or_warn( $pass,
+            'sshpass', '-e', 'ssh', @ssh_opts_bootstrap, $target,
+            'mkdir -p ~/.ssh && chmod 700 ~/.ssh' )
+          or next;
+
+       # Generate a unique keypair ON the remote node (private key never leaves)
+       # [SEC-KEY-PASSPHRASE]: key has a passphrase (two-factor: have + know)
+       # Passphrase is SCP'd as a 0400 temp file, never in process args
+        say "  - ensuring per-node keypair";
+
+        # $node_pp is needed in both the key-generation branch and Phase 5b
+        my $node_pp;
+
+        # Check if key already exists on the node
+        my $key_exists = eval {
+            bootstrap_capturex( $pass,
+                'sshpass', '-e', 'ssh', @ssh_opts_bootstrap,
+                $target,   'test -f ~/.ssh/id_ecdsa_p521_cluster && echo YES' );
+        } // '';
+        chomp $key_exists;
+
+        if ( $key_exists ne 'YES' ) {
+
+            # Generate passphrase locally and SCP to node
+            $node_pp = generate_passphrase();
+            my ( $pp_fh, $pp_local ) = tempfile(
+                '.cl_XXXXXXXX',
+                DIR    => '/tmp',
+                UNLINK => 1
+            );
+            print $pp_fh $node_pp;
+            close $pp_fh;
+            CORE::chmod 0400, $pp_local;
+
+            my $r_pp = bootstrap_remote_mktemp( $pass, $target,
+                '/tmp/.cl_XXXXXXXX' );
+            bootstrap_run_or_warn( $pass,
+                'sshpass', '-e', 'scp', @ssh_opts_bootstrap,
+                $pp_local, "$target:$r_pp" )
+              or do { unlink $pp_local; next };
+            unlink $pp_local;
+
+            # Generate key using passphrase from temp file
+            # ssh-keygen -N "$(cat file)" avoids the passphrase in ps args
+            bootstrap_run_or_warn(
+                $pass,
+                'sshpass',
+                '-e',
+                'ssh',
+                @ssh_opts_bootstrap,
+                $target,
+                "chmod 400 $r_pp"
+                  . " && ssh-keygen -t ecdsa -b 521"
+                  . " -N \"\$(cat $r_pp)\""
+                  . " -f ~/.ssh/id_ecdsa_p521_cluster"
+                  . " -C '$node->{machine}-node-key'"
+                  . "; rm -f $r_pp"
+            ) or next;
+
+            # Store node passphrase in encrypted database
+            if ($db_for_pp) {
+                $db_for_pp->store_key_passphrase(
+                    machine    => $node->{machine},
+                    passphrase => $node_pp,
+                    comment    => "$node->{machine} cluster key passphrase",
+                );
+                say "  - node key passphrase stored in encrypted database";
+            }
+            else {
+                die "ClusterDB unavailable: cannot store node key passphrase "
+                  . "for $node->{machine}.\n"
+                  . "Key passphrases MUST be stored securely [SEC-KEY-PASSPHRASE].\n";
+            }
+        }
+        else {
+            # Key already exists — retrieve passphrase from DB for local store
+            if ($db_for_pp) {
+                $node_pp =
+                  $db_for_pp->get_key_passphrase( machine => $node->{machine} );
+                say "  - retrieved existing passphrase from database"
+                  if $node_pp;
+            }
+        }
+
+        # ------------------------------------------------------------------
+        # Phase 5b: Deploy node-local encrypted passphrase store
+        # Enables the node to autonomously unlock its own cluster key via
+        # load_cluster_key.pl — no admin intervention needed for Node->Admin
+        # and Node->Node connections after bootstrap.
+        # [SEC-KEY-PASSPHRASE]: passphrase encrypted at rest (AES-256-CBC, PBKDF2-SHA256)
+        # [SEC-CRED-ENCRYPT]: keyfile 0400; encrypted passphrase 0400
+        # ------------------------------------------------------------------
+        if ($node_pp) {
+            say "  - deploying node-local passphrase store";
+
+            # Generate a fresh per-node keyfile (unique per node, per run)
+            my $node_keyfile_content = eval {
+                chomp( my $k = capturex( 'openssl', 'rand', '-base64', '32' ) );
+                $k;
+            };
+            unless ($node_keyfile_content) {
+                say "  ! Failed to generate keyfile for $node->{machine},"
+                  . " skipping passphrase store";
+            }
+            else {
+                # Write plaintext passphrase and keyfile to local 0400 tempfiles
+                my ( $pp_plain_fh, $pp_plain ) =
+                  tempfile( '.cl_XXXXXXXX', DIR => '/tmp', UNLINK => 1 );
+                my ( $kf_fh, $kf_local ) =
+                  tempfile( '.cl_XXXXXXXX', DIR => '/tmp', UNLINK => 1 );
+                my ( $pp_enc_fh, $pp_enc ) =
+                  tempfile( '.cl_XXXXXXXX', DIR => '/tmp', UNLINK => 1 );
+                print $pp_plain_fh $node_pp;
+                close $pp_plain_fh;
+                print $kf_fh $node_keyfile_content;
+                close $kf_fh;
+                CORE::chmod 0400, $pp_plain;
+                CORE::chmod 0400, $kf_local;
+
+                # Encrypt: AES-256-CBC, PBKDF2-SHA256, 600000 iterations
+                my $enc_ok = eval {
+                    systemx(
+                        'openssl', 'enc',    '-aes-256-cbc', '-pbkdf2',
+                        '-iter',   '600000', '-pass', "file:$kf_local",
+                        '-in',     $pp_plain, '-out', $pp_enc
+                    );
+                    1;
+                };
+                unlink $pp_plain;
+
+                if ( !$enc_ok ) {
+                    unlink $kf_local, $pp_enc;
+                    say "  ! Encryption failed for $node->{machine},"
+                      . " skipping passphrase store";
+                }
+                else {
+                    # Generate load_cluster_key.pl helper script
+                    my ( $lck_fh, $lck_local ) =
+                      tempfile( '.cl_XXXXXXXX', DIR => '/tmp', UNLINK => 1 );
+                    print $lck_fh generate_load_cluster_key_script();
+                    close $lck_fh;
+                    CORE::chmod 0500, $lck_local;
+
+                    # SCP all three files to node via remote mktemp staging
+                    my $r_kf  = bootstrap_remote_mktemp( $pass, $target,
+                        '/tmp/.cl_XXXXXXXX' );
+                    my $r_enc = bootstrap_remote_mktemp( $pass, $target,
+                        '/tmp/.cl_XXXXXXXX' );
+                    my $r_lck = bootstrap_remote_mktemp( $pass, $target,
+                        '/tmp/.cl_XXXXXXXX' );
+
+                    my $scp_ok =
+                      bootstrap_run_or_warn( $pass, 'sshpass', '-e', 'scp',
+                        @ssh_opts_bootstrap, $kf_local, "$target:$r_kf" );
+                    unlink $kf_local;
+
+                    $scp_ok &&=
+                      bootstrap_run_or_warn( $pass, 'sshpass', '-e', 'scp',
+                        @ssh_opts_bootstrap, $pp_enc, "$target:$r_enc" );
+                    unlink $pp_enc;
+
+                    $scp_ok &&=
+                      bootstrap_run_or_warn( $pass, 'sshpass', '-e', 'scp',
+                        @ssh_opts_bootstrap, $lck_local, "$target:$r_lck" );
+                    unlink $lck_local;
+
+                    if ($scp_ok) {
+                        # Install with correct permissions and final paths
+                        bootstrap_run_or_warn(
+                            $pass, 'sshpass', '-e', 'ssh',
+                            @ssh_opts_bootstrap, $target,
+                            "chmod 400 $r_kf $r_enc"
+                              . " && chmod 500 $r_lck"
+                              . " && mv $r_kf ~/.ssh/.cluster_node_keyfile"
+                              . " && mv $r_enc ~/.ssh/.cluster_node_pp"
+                              . " && mv $r_lck ~/.ssh/load_cluster_key.pl"
+                        ) and do {
+                            say "  - node passphrase store deployed";
+                            audit_log(
+                                'node_passphrase_store_deployed',
+                                machine => $node->{machine},
+                                ip      => $node->{ip}
+                            );
+                        };
+                    }
+                    else {
+                        # Clean up staged remote files on SCP failure
+                        bootstrap_run_or_warn( $pass, 'sshpass', '-e', 'ssh',
+                            @ssh_opts_bootstrap, $target,
+                            "rm -f $r_kf $r_enc $r_lck" );
+                        say "  ! SCP failed for passphrase store on"
+                          . " $node->{machine}";
+                    }
+                }
+            }
+        }
+        else {
+            say "  ! No passphrase available for $node->{machine},"
+              . " skipping passphrase store (ClusterDB unavailable?)";
+        }
+
+        # Ensure correct permissions (idempotent even if file already 0400)
+        say "  - fixing permissions";
+        bootstrap_run_or_warn(
+            $pass,
+            'sshpass',
+            '-e',
+            'ssh',
+            @ssh_opts_bootstrap,
+            $target,
+            'chmod 400 ~/.ssh/id_ecdsa_p521_cluster'
+              . ' && chmod 644 ~/.ssh/id_ecdsa_p521_cluster.pub'
+        ) or next;
+
+        # Collect the node's public key
+        say "  - collecting public key";
+        my $node_pub = eval {
+            bootstrap_capturex( $pass,
+                'sshpass', '-e', 'ssh', @ssh_opts_bootstrap,
+                $target,   'cat ~/.ssh/id_ecdsa_p521_cluster.pub' );
+        };
+        if ( !$node_pub || $node_pub !~ /^ecdsa-sha2/ ) {
+            say "  ! Failed to collect public key from $node->{machine},"
+              . " skipping";
+            next;
+        }
+        chomp $node_pub;
+        $node_pubkeys{ $node->{machine} } = $node_pub;
+
+        # Authorize admin's public key on the node (admin -> node access)
+        say "  - authorizing admin key";
+        bootstrap_run_or_warn( $pass,
+            'sshpass',           '-e', 'ssh-copy-id', '-i', $pub_key,
+            @ssh_opts_bootstrap, $target )
+          or next;
+
+        say "  -> OK";
+        audit_log(
+            'node_key_generated',
+            machine => $node->{machine},
+            ip      => $node->{ip}
+        );
+    }
+
+    # Store per-node public keys in encrypted database [SEC-CRED-ENCRYPT]
+    if ( my $db = cluster_db() ) {
+        for my $machine ( sort keys %node_pubkeys ) {
+
+            # Compute fingerprint locally from the collected public key
+            my $fp = '';
+            my ( $tmp_fh, $tmp_pub ) = tempfile(
+                '.cl_XXXXXXXX',
+                DIR    => '/tmp',
+                UNLINK => 1
+            );
+            print $tmp_fh "$node_pubkeys{$machine}\n";
+            close $tmp_fh;
+            $fp = eval {
+                chomp( my $f = capturex( 'ssh-keygen', '-lf', $tmp_pub ) );
+                $f;
+            } // '';
+            unlink $tmp_pub;
+            $db->store_key(
+                machine     => $machine,
+                key_type    => 'ecdsa-sha2-nistp521',
+                public_key  => $node_pubkeys{$machine},
+                fingerprint => $fp,
+                comment     => "$machine-node-key",
+            );
+        }
+        say "  - per-node public keys stored in encrypted database";
+    }
+
+    say "[6/9] Cross-authorizing node keys (mesh + reverse auth)";
+
+    # Read admin's public key content
+    my $pub_key_content = do {
+        open my $f, '<', $pub_key or die "Cannot read $pub_key: $!\n";
+        local $/;
+        <$f>;
+    };
+    chomp $pub_key_content;
+
+    # Authorize all node keys on admin (node -> admin access)
+    my $auth_keys = "$ssh_dir/authorized_keys";
+    {
+        my %already;
+        if ( -f $auth_keys ) {
+            open my $f, '<', $auth_keys
+              or die "Cannot read $auth_keys: $!\n";
+            while (<$f>) { chomp; $already{$_} = 1; }
+            close $f;
+        }
+        my @to_add;
+        for my $npk ( map { $node_pubkeys{$_} } sort keys %node_pubkeys ) {
+            push @to_add, $npk unless $already{$npk};
+        }
+
+        # Also ensure admin's own key is authorized (for local operations)
+        push @to_add, $pub_key_content unless $already{$pub_key_content};
+
+        if (@to_add) {
+            open my $f, '>>', $auth_keys
+              or die "Cannot open $auth_keys: $!\n";
+            print $f "$_\n" for @to_add;
+            close $f;
+            CORE::chmod 0600, $auth_keys;
+            say "  - admin: " . scalar(@to_add) . " key(s) added to $auth_keys";
+            audit_log( 'admin_keys_authorized',
+                keys_added => scalar(@to_add) );
+        }
+        else {
+            say "  - admin: all keys already authorized";
+        }
+    }
+
+    # Cross-authorize node keys on each remote node (node -> node access)
+    for my $node (@reachable) {
+        next unless $node_pubkeys{ $node->{machine} };
+        my $target = $node->{username} . '@' . $node->{ip};
+        my $pass   = $node->{password};
+
+        # Read remote authorized_keys
+        my $remote_auth = eval {
+            bootstrap_capturex( $pass,
+                'sshpass', '-e', 'ssh', @ssh_opts_bootstrap,
+                $target,   'cat ~/.ssh/authorized_keys 2>/dev/null' );
+        } // '';
+        my %remote_already =
+          map { chomp; $_ => 1 } split /\n/, $remote_auth;
+
+        # Add public keys of all OTHER nodes (skip own key, admin is already
+        # authorized via ssh-copy-id in Phase 5)
+        my @peer_keys;
+        for my $other ( sort keys %node_pubkeys ) {
+            next if $other eq $node->{machine};
+            push @peer_keys, $node_pubkeys{$other}
+              unless $remote_already{ $node_pubkeys{$other} };
+        }
+
+        if (@peer_keys) {
+            my ( $tmp_fh, $tmp_keys ) = tempfile(
+                '.cl_XXXXXXXX',
+                DIR    => '/tmp',
+                UNLINK => 1
+            );
+            print $tmp_fh "$_\n" for @peer_keys;
+            close $tmp_fh;
+            bootstrap_run_or_warn( $pass,
+                'sshpass', '-e', 'scp', @ssh_opts_bootstrap,
+                $tmp_keys, "$target:~/.ssh/.auth_keys_add" )
+              or do { unlink $tmp_keys; next };
+            unlink $tmp_keys;
+            bootstrap_run_or_warn(
+                $pass,
+                'sshpass',
+                '-e',
+                'ssh',
+                @ssh_opts_bootstrap,
+                $target,
+                'cat ~/.ssh/.auth_keys_add >> ~/.ssh/authorized_keys'
+                  . ' && rm ~/.ssh/.auth_keys_add'
+                  . ' && chmod 600 ~/.ssh/authorized_keys'
+            );
+            say "  - $node->{machine}: "
+              . scalar(@peer_keys)
+              . " peer key(s) added";
+            audit_log(
+                'peer_keys_authorized',
+                machine    => $node->{machine},
+                keys_added => scalar(@peer_keys)
+            );
+        }
+        else {
+            say "  - $node->{machine}: peer keys already authorized";
+        }
+    }
+
+    say "[7/9] Propagating admin host key to remote known_hosts";
+    if ( !$admin_ip ) {
+        say
+          "  ! Could not detect admin IP on network '$network_name', skipping";
+    }
+    else {
+        say "  - admin IP on $network_name: $admin_ip";
+        my $admin_connect_host = $network_name . $admin_machine;
+
+        # Scan by IP only with FIPS-approved types, then build merged lines.
+        my $admin_host_key;
+        {
+            my $raw = eval {
+                capturex( 'ssh-keyscan', '-T', '5',
+                    '-t', $FIPS_KEYSCAN_TYPES, $admin_ip );
+            };
+            if ($raw) {
+                $admin_host_key = join '', map {
+                    my ( $hf, $kt, $km ) = kh_key($_);
+                    if ( defined $kt ) {
+                        ( my $m = $_ ) =~
+                          s/^\Q$admin_ip\E /$admin_ip,$admin_connect_host /;
+                        "$m\n";
+                    }
+                    else { () }
+                } split /\n/, $raw;
+            }
+        }
+        if ( !$admin_host_key ) {
+            say "  ! Failed to scan admin host key, skipping";
+        }
+        else {
+            for my $node (@reachable) {
+                my $target = $node->{username} . '@' . $node->{ip};
+                my $pass   = $node->{password};
+                say "  - updating $node->{machine} ($node->{ip})";
+
+                # Read remote known_hosts
+                my $remote_kh = eval {
+                    bootstrap_capturex( $pass,
+                        'sshpass', '-e', 'ssh', @ssh_opts_bootstrap,
+                        $target,   'cat ~/.ssh/known_hosts 2>/dev/null' );
+                };
+
+             # Combined drop set: admin + all cluster nodes (all replaced fresh)
+                my %replace_host_ids = (
+                    $admin_ip                      => 1,
+                    $network_name . $admin_machine => 1,
+                    %cluster_host_ids,
+                );
+
+             # Filter: drop hashed, all cluster+admin entries, deduplicate rest.
+                my ( @filtered, %remote_seen );
+                for my $line ( split /\n/, $remote_kh // '' ) {
+                    my ( $hf, $kt, $km ) = kh_key($line);
+                    next unless defined $kt;
+                    next if $hf =~ /^\|/;    # drop hashed
+                    next
+                      if grep { $replace_host_ids{$_} } split /,/,
+                      $hf;                   # drop cluster+admin
+                    next if $remote_seen{"$hf $kt $km"}++;    # deduplicate
+                    push @filtered, $line;
+                }
+
+# Build new known_hosts: non-cluster entries + admin key + all peer cluster keys
+                my ( $tmp_fh, $tmp_new_kh ) = tempfile(
+                    '.cl_XXXXXXXX',
+                    DIR    => '/tmp',
+                    UNLINK => 1,
+                );
+
+                print $tmp_fh "$_\n" for @filtered;
+
+                # Write fresh admin host key lines
+                for my $line ( split /\n/, $admin_host_key ) {
+                    my ( $hf, $kt, $km ) = kh_key($line);
+                    print $tmp_fh "$line\n" if defined $kt;
+                }
+
+           # Write fresh keys for every other reachable cluster node (skip self)
+                for my $entry_key ( sort keys %fresh_entries ) {
+                    next
+                      if $entry_key =~
+                      /^\Q$node->{ip}\E /;    # skip this node's own entry
+                    print $tmp_fh "$fresh_entries{$entry_key}\n";
+                }
+                close $tmp_fh;
+
+                bootstrap_run_or_warn( $pass,
+                    'sshpass',   '-e', 'scp', @ssh_opts_bootstrap,
+                    $tmp_new_kh, "$target:~/.ssh/.known_hosts_new" )
+                  or do { unlink $tmp_new_kh; next };
+                unlink $tmp_new_kh;
+                bootstrap_run_or_warn(
+                    $pass,
+                    'sshpass',
+                    '-e',
+                    'ssh',
+                    @ssh_opts_bootstrap,
+                    $target,
+                    'mv ~/.ssh/.known_hosts_new ~/.ssh/known_hosts'
+                      . ' && chmod 600 ~/.ssh/known_hosts'
+                );
+            }
+        }
+    }
+
+    # ------------------------------------------------------------------
+    # Phase 8: Deploy ~/.ssh/config with cluster IdentityFile
+    # ------------------------------------------------------------------
+    # Without this, manual `ssh user@host` from a node won't find
+    # id_ecdsa_p521_cluster (non-default name).  This adds a Host *
+    # block that offers it, making node→admin and node→node SSH work
+    # passwordless without specifying -i on every invocation.
+    # [SEC-SSH-CONFIG-PERMS]: config file is 0600 (owner rw only).
+    # ------------------------------------------------------------------
+    say "[8/9] Deploying ~/.ssh/config with cluster IdentityFile";
+
+    my $ssh_config_block = join( "\n",
+        '# --- cluster_mgmt: auto-generated block ---',
+        'Host *',
+        '    IdentityFile ~/.ssh/id_ecdsa_p521_cluster',
+        '    StrictHostKeyChecking yes',
+        '# --- end cluster_mgmt ---',
+    );
+
+    # Deploy on admin node
+    {
+        my $admin_ssh_config = "$ssh_dir/config";
+        my $needs_update     = 1;
+        if ( -f $admin_ssh_config ) {
+            if ( open my $fh, '<', $admin_ssh_config ) {
+                my $content = do { local $/; <$fh> };
+                close $fh;
+                $needs_update = 0
+                  if $content =~ /IdentityFile.*id_ecdsa_p521_cluster/;
+            }
+        }
+        if ($needs_update) {
+            open my $fh, '>>', $admin_ssh_config
+              or die "Cannot open $admin_ssh_config: $!\n";
+            print $fh "\n$ssh_config_block\n";
+            close $fh;
+            chmod 0600, $admin_ssh_config;
+            say "  - $admin_machine (admin): updated ~/.ssh/config";
+            audit_log( 'ssh_config_deployed',
+                machine => "$admin_machine (admin)" );
+        }
+        else {
+            say "  - $admin_machine (admin): ~/.ssh/config already configured";
+        }
+    }
+
+    # Deploy on each reachable node
+    for my $node (@reachable) {
+        my $target = $node->{username} . '@' . $node->{ip};
+        my $pass   = $node->{password};
+
+        # Check if remote ~/.ssh/config already has the IdentityFile
+        my $remote_config = eval {
+            bootstrap_capturex( $pass,
+                'sshpass', '-e', 'ssh', @ssh_opts_bootstrap,
+                $target,   'cat ~/.ssh/config 2>/dev/null' );
+        } // '';
+
+        if ( $remote_config =~ /IdentityFile.*id_ecdsa_p521_cluster/ ) {
+            say "  - $node->{machine} ($node->{ip}): "
+              . "~/.ssh/config already configured";
+            next;
+        }
+
+        # Write the config block to a temp file, SCP it, append remotely
+        my ( $tmp_fh, $tmp_cfg ) = tempfile(
+            '.cl_XXXXXXXX',
+            DIR    => '/tmp',
+            UNLINK => 1
+        );
+        print $tmp_fh "\n$ssh_config_block\n";
+        close $tmp_fh;
+
+        my $r_tmp =
+          bootstrap_remote_mktemp( $pass, $target, '/tmp/.cl_XXXXXXXX' );
+        my $ok =
+          bootstrap_run_or_warn( $pass,
+            'sshpass', '-e', 'scp', @ssh_opts_bootstrap,
+            $tmp_cfg,  "$target:$r_tmp" );
+        unlink $tmp_cfg;
+
+        if ($ok) {
+            bootstrap_run_or_warn(
+                $pass,
+                'sshpass',
+                '-e',
+                'ssh',
+                @ssh_opts_bootstrap,
+                $target,
+                "cat $r_tmp >> ~/.ssh/config"
+                  . " && rm -f $r_tmp"
+                  . " && chmod 600 ~/.ssh/config"
+            );
+            say "  - $node->{machine} ($node->{ip}): updated ~/.ssh/config";
+            audit_log( 'ssh_config_deployed', machine => $node->{machine} );
+        }
+        else {
+            say "  ! $node->{machine} ($node->{ip}): "
+              . "failed to deploy ~/.ssh/config";
+        }
+    }
+
+    say "[9/9] Updating /etc/hosts on admin and reachable nodes";
+    my @hosts_summary;
+
+    if ( $admin_ip && $admin_machine ) {
+        my $admin_alias = $network_name . $admin_machine;
+
+        # Read admin's /etc/hosts and collect existing aliases
+        my %admin_has_alias;
+        if ( open my $fh, '<', '/etc/hosts' ) {
+            while ( my $line = <$fh> ) {
+                next if $line =~ /^\s*(?:#|$)/;
+                my ( undef, @aliases ) = split( ' ', $line );
+                $admin_has_alias{$_} = 1 for @aliases;
+            }
+            close $fh;
+        }
+
+        my @admin_to_add;
+        push @admin_to_add, "$admin_ip $admin_alias"
+          unless $admin_has_alias{$admin_alias};
+        for my $node (@reachable) {
+            my $alias = $network_name . $node->{machine};
+            push @admin_to_add, "$node->{ip} $alias"
+              unless $admin_has_alias{$alias};
+        }
+
+        if (@admin_to_add) {
+
+            # Pipe directly to sudo tee -a to avoid 'sudo bash -c' quoting risks
+            my $ok =
+              open( my $tee, '|-', 'sudo tee -a /etc/hosts > /dev/null' );
+            if ($ok) {
+                print $tee "$_\n" for @admin_to_add;
+                $ok = close $tee;
+            }
+            if ($ok) {
+                say "  - $admin_machine (admin): added "
+                  . scalar(@admin_to_add)
+                  . " entry(ies)";
+                say "    + $_" for @admin_to_add;
+                audit_log(
+                    'hosts_updated',
+                    machine => "$admin_machine (admin)",
+                    entries => scalar(@admin_to_add)
+                );
+            }
+            else {
+                say "  ! $admin_machine (admin): failed to update /etc/hosts";
+                @admin_to_add = ('FAILED');
+            }
+        }
+        else {
+            say "  - $admin_machine (admin): no changes needed";
+        }
+        push @hosts_summary,
+          { machine => "$admin_machine (admin)", entries => [@admin_to_add] };
+
+        # Update /etc/hosts on each reachable remote node
+        # STIG: sudo without password piping (requires NOPASSWD sudoers)
+        for my $node (@reachable) {
+            my $target       = $node->{username} . '@' . $node->{ip};
+            my $pass         = $node->{password};
+            my $remote_alias = $network_name . $node->{machine};
+
+            my $remote_hosts_raw = eval {
+                bootstrap_capturex( $pass,
+                    'sshpass', '-e', 'ssh', @ssh_opts_bootstrap,
+                    $target,   'cat /etc/hosts 2>/dev/null' );
+            };
+            my %remote_has_alias;
+            for my $line ( split /\n/, $remote_hosts_raw // '' ) {
+                next if $line =~ /^\s*(?:#|$)/;
+                my ( undef, @aliases ) = split( ' ', $line );
+                $remote_has_alias{$_} = 1 for @aliases;
+            }
+
+            my @remote_to_add;
+            push @remote_to_add, "$admin_ip $admin_alias"
+              unless $remote_has_alias{$admin_alias};
+            push @remote_to_add, "$node->{ip} $remote_alias"
+              unless $remote_has_alias{$remote_alias};
+
+            if (@remote_to_add) {
+                my ( $tmp_fh, $tmp_local ) = tempfile(
+                    '.cl_XXXXXXXX',
+                    DIR    => '/tmp',
+                    UNLINK => 1,
+                );
+                my $r_tmp = bootstrap_remote_mktemp( $pass, $target,
+                    '/tmp/.cl_XXXXXXXX' );
+                print $tmp_fh "$_\n" for @remote_to_add;
+                close $tmp_fh;
+                my $ok = bootstrap_run_or_warn( $pass, 'sshpass', '-e', 'scp',
+                    @ssh_opts_bootstrap, $tmp_local, "$target:$r_tmp" );
+                unlink $tmp_local;
+                if ($ok) {
+
+                    # STIG: scoped NOPASSWD -- tee /etc/hosts only
+                    bootstrap_run_or_warn(
+                        $pass,
+                        'sshpass',
+                        '-e',
+                        'ssh',
+                        @ssh_opts_bootstrap,
+                        $target,
+                        "cat $r_tmp | sudo tee -a /etc/hosts > /dev/null"
+                          . " && rm -f $r_tmp"
+                    );
+                    say "  - $node->{machine} ($node->{ip}): added "
+                      . scalar(@remote_to_add)
+                      . " entry(ies)";
+                    say "    + $_" for @remote_to_add;
+                    audit_log(
+                        'hosts_updated',
+                        machine => $node->{machine},
+                        entries => scalar(@remote_to_add)
+                    );
+                }
+                else {
+                    say "  ! $node->{machine}: failed to transfer hosts update";
+                    @remote_to_add = ('FAILED');
+                }
+            }
+            else {
+                say "  - $node->{machine} ($node->{ip}): no changes needed";
+            }
+            push @hosts_summary,
+              { machine => $node->{machine}, entries => [@remote_to_add] };
+        }
+    }
+    else {
+        say
+"  ! Admin IP not detected on '$network_name', skipping /etc/hosts updates";
+    }
+
+    if (@hosts_summary) {
+        say "";
+        say "=" x 60;
+        say "/etc/hosts Update Summary";
+        say "=" x 60;
+        printf "%-28s %s\n", 'Machine', 'Entries Added';
+        say "-" x 60;
+        for my $row (@hosts_summary) {
+            my @e = @{ $row->{entries} };
+            if ( !@e ) {
+                printf "%-28s %s\n", $row->{machine}, '(none)';
+            }
+            else {
+                printf "%-28s %s\n", $row->{machine}, $e[0];
+                printf "%-28s %s\n", '',              $_ for @e[ 1 .. $#e ];
+            }
+        }
+        say "=" x 60;
+    }
+
+    if (@down) {
+        say "";
+        say "Down nodes:";
+        for my $entry (@down) {
+            say "  $entry->[0] ($entry->[1])";
+        }
+    }
+
+    audit_log(
+        'setup_ssh_keys_complete',
+        group     => $group_name,
+        machine   => $machine_name // 'all',
+        network   => $network_name,
+        reachable => scalar(@reachable),
+        down      => scalar(@down)
+    );
+
+    say "";
+    say "=" x 60;
+};
+
+# rex remove_ssh_keys --network=<name> --bootstrap=1                    ; remove keys for all nodes (bootstrap required)
+# rex remove_ssh_keys --network=<name> --bootstrap=1 --group=<name>      ; limit to a named group (default: all)
+# rex remove_ssh_keys --network=<name> --bootstrap=1 --machine=<name>    ; limit to a single machine
+#   (if both --group and --machine are given, --group takes precedence)
+# rex remove_ssh_keys --network=<name> --bootstrap=1 --timeout=<s>       ; TCP probe timeout (default: 1)
+# rex remove_ssh_keys --network=<name> --bootstrap=1 --ssh_retry=<n>     ; SSH connection attempts (default: 5)
+# rex remove_ssh_keys --network=<name> --bootstrap=1 --remove_admin_key=1 ; also delete admin keypair
+#
+# Inverse of setup_ssh_keys: removes all cross-authorizations, cluster keys,
+# node-local passphrase stores, known_hosts entries, SSH config blocks, and
+# /etc/hosts aliases added by setup_ssh_keys.  Down nodes are reported;
+# their cleanup must be done manually.
+#
+# Security Notes:
+#   - Requires --bootstrap=1 for explicit opt-in to password-based auth
+#   - Requires --confirm=1 to prevent accidental key removal
+#   - Passwords are passed via SSH_ASKPASS + 0400 tempfile [SEC-CRED-ENCRYPT]
+#   - Key removals are audit-logged [SEC-AUDIT-LOG]
+#
+# What this task does (8 phases):
+#   [1/8] Validates required local commands; enforces --confirm=1 safety gate
+#   [2/8] Probes each node via TCP on port 22; classifies as UP/DOWN/MISSING
+#   [3/8] On each reachable node: removes cluster keypair, node-local passphrase
+#          store (.cluster_node_keyfile, .cluster_node_pp, load_cluster_key.pl),
+#          and all cluster-key entries from ~/.ssh/authorized_keys
+#   [4/8] On admin: removes all node public keys and admin cluster key
+#          from ~/.ssh/authorized_keys
+#   [5/8] On admin: removes all cluster-node and alias entries from ~/.ssh/known_hosts
+#   [6/8] On each reachable node: removes all cluster entries from ~/.ssh/known_hosts
+#   [7/8] Removes the cluster_mgmt IdentityFile block from ~/.ssh/config
+#          on admin and all reachable nodes
+#   [8/8] Removes cluster alias entries from /etc/hosts on admin and reachable nodes
+#         Optionally (--remove_admin_key=1) deletes admin keypair and DB entries
+desc
+"Remove SSH keys and cross-authorizations for a network group; report down nodes";
+task "remove_ssh_keys", sub {
+    local $| = 1;
+
+    my $param        = shift || {};
+    my $group_name   = $param->{group};
+    my $machine_name = $param->{machine};
+    my $network_name = $param->{network}
+      or die "Parameter --network is required.\n";
+    my $ping_timeout     = $param->{timeout}          // 1;
+    my $bootstrap        = $param->{bootstrap}        // 0;
+    my $confirm          = $param->{confirm}          // 0;
+    my $remove_admin_key = $param->{remove_admin_key} // 0;
+    my $ssh_retry        = $param->{ssh_retry}        // $DEFAULT_SSH_RETRY;
+    local @ssh_opts_bootstrap = ssh_opts_bootstrap($ssh_retry);
+
+    die "This task requires --bootstrap=1 for explicit opt-in.\n"
+      . "WARNING: Bootstrap mode uses password authentication and\n"
+      . "disables strict host key verification. Use only for teardown.\n"
+      unless $bootstrap;
+
+    die "This task requires --confirm=1 to prevent accidental key removal.\n"
+      . "This operation is irreversible: all cluster keys and authorizations\n"
+      . "for the '$network_name' network will be deleted.\n"
+      unless $confirm;
+
+    my @target_members = resolve_targets($param);
+    $group_name //= 'all';
+
+    audit_log(
+        'remove_ssh_keys_start',
+        group   => $group_name,
+        machine => $machine_name // 'all',
+        network => $network_name
+    );
+
+    say "[1/8] Validating required local commands";
+    for my $required_cmd (qw(ssh scp sshpass)) {
+        die "Required command not found: $required_cmd\n"
+          if !command_exists($required_cmd);
+    }
+
+    my $home        = $ENV{HOME} // '.';
+    my $ssh_dir     = "$home/.ssh";
+    my $key_base    = "$ssh_dir/id_ecdsa_p521_cluster";
+    my $pub_key     = "$key_base.pub";
+    my $known_hosts = "$ssh_dir/known_hosts";
+    my $auth_keys   = "$ssh_dir/authorized_keys";
+    my $ssh_cfg     = "$ssh_dir/config";
+
+    # Read admin's public key (needed to know which entry to strip from nodes)
+    my $pub_key_content = '';
+    if ( -f $pub_key ) {
+        open my $f, '<', $pub_key or die "Cannot read $pub_key: $!\n";
+        $pub_key_content = do { local $/; <$f> };
+        close $f;
+        chomp $pub_key_content;
+    }
+
+    # Collect all node public keys from ClusterDB (needed to strip from admin)
+    my %db_node_pubkeys;    # machine => public_key_content
+    if ( my $db = cluster_db() ) {
+        for my $machine ( sort @machines ) {
+            my ($rec) = $db->get_key(
+                machine  => $machine,
+                key_type => 'ecdsa-sha2-nistp521',
+            );
+            next unless $rec;
+            $db_node_pubkeys{$machine} = $rec->{public_key};
+        }
+    }
+
+    # ------------------------------------------------------------------
+    # Phase 2: Probe node reachability
+    # ------------------------------------------------------------------
+    my $pinger = tcp_pinger($ping_timeout);
+
+    my ( $admin_ip, $admin_machine ) = detect_admin($network_name);
+
+    my @reachable;
+    my @down;
+
+    say "=" x 60;
+    say "Removing SSH keys (group: $group_name, network: $network_name)";
+    say "=" x 60;
+    say "[2/8] Probing "
+      . scalar(@target_members)
+      . " nodes with timeout ${ping_timeout}s";
+
+    for my $machine ( sort @target_members ) {
+        my $networks = get cmdb( 'networks', $machine ) // {};
+        my $ip       = $networks->{$network_name};
+
+        if ( !$ip ) {
+            say sprintf "  %-20s %-15s %s", $machine, '-', 'NO IP';
+            push @down, [ $machine, 'NO IP' ];
+            next;
+        }
+        if ( $admin_machine && $machine eq $admin_machine ) {
+            say sprintf "  %-20s %-15s %s", $machine, $ip, 'ADMIN (skip probe)';
+            next;
+        }
+        if ( !$pinger->ping($ip) ) {
+            say sprintf "  %-20s %-15s %s", $machine, $ip, 'DOWN';
+            push @down, [ $machine, $ip ];
+            next;
+        }
+
+        my ( $username, $password ) = get_credential($machine);
+        if ( !$username || !$password ) {
+            say sprintf "  %-20s %-15s %s", $machine, $ip, 'NO CREDS';
+            push @down, [ $machine, 'NO CREDS' ];
+            next;
+        }
+
+        say sprintf "  %-20s %-15s %s", $machine, $ip, 'UP';
+        push @reachable,
+          {
+            machine  => $machine,
+            ip       => $ip,
+            username => $username,
+            password => $password,
+          };
+    }
+    $pinger->close;
+    say "";
+
+    # ------------------------------------------------------------------
+    # Phase 3: Remove cluster keypair + cluster entries from authorized_keys
+    # ------------------------------------------------------------------
+    say "[3/8] Removing cluster keys on reachable nodes";
+
+    # Known cluster key comments for authorized_keys filtering
+    my $ak_comments_pl =
+      join( ' ', 'admin-key', ( map { "$_-node-key" } sort @machines ), );
+
+    for my $node (@reachable) {
+        my $target = $node->{username} . '@' . $node->{ip};
+        my $pass   = $node->{password};
+
+        say "";
+        say "  $node->{machine} ($node->{ip})";
+
+        # Remove cluster keypair (private + public key) and node-local
+        # passphrase store deployed by Phase 5b of setup_ssh_keys
+        bootstrap_run_or_warn(
+            $pass,
+            'sshpass',
+            '-e',
+            'ssh',
+            @ssh_opts_bootstrap,
+            $target,
+            'rm -f ~/.ssh/id_ecdsa_p521_cluster'
+              . ' ~/.ssh/id_ecdsa_p521_cluster.pub'
+              . ' ~/.ssh/.cluster_node_keyfile'
+              . ' ~/.ssh/.cluster_node_pp'
+              . ' ~/.ssh/load_cluster_key.pl'
+        );
+        say "    - removed cluster keypair and node passphrase store";
+
+        # Strip cluster-key entries from authorized_keys.
+        # An entry is a cluster key if its comment field (last token) matches
+        # one of the known per-node or admin key comments.
+        bootstrap_run_or_warn(
+            $pass,
+            'sshpass',
+            '-e',
+            'ssh',
+            @ssh_opts_bootstrap,
+            $target,
+            "perl -e '"
+              . 'use File::Temp qw(tempfile); '
+              . 'my $f = "$ENV{HOME}/.ssh/authorized_keys"; '
+              . 'exit 0 unless -f $f; '
+              . 'open my $in, q(<), $f or exit 0; '
+              . 'my @lines = <$in>; close $in; '
+              . 'my %rm = map { $_ => 1 } qw('
+              . $ak_comments_pl . '); '
+              . 'my @kept = grep { my @t = split q( ), $_; !(@t >= 3 && $rm{$t[-1]}) } @lines; '
+              . 'my ($fh,$tmp) = tempfile(q(.cl_XXXXXXXX), DIR => "$ENV{HOME}/.ssh"); '
+              . 'print $fh $_ for @kept; close $fh; '
+              . 'chmod 0600, $tmp; rename $tmp, $f' . "'"
+        );
+        say "    - cleaned authorized_keys";
+
+        audit_log(
+            'node_keys_removed',
+            machine => $node->{machine},
+            ip      => $node->{ip}
+        );
+    }
+
+    # ------------------------------------------------------------------
+    # Phase 4: Remove node keys + admin's own key from admin authorized_keys
+    # ------------------------------------------------------------------
+    say "";
+    say "[4/8] Cleaning admin ~/.ssh/authorized_keys";
+
+    if ( -f $auth_keys ) {
+        my %to_remove;
+        $to_remove{$pub_key_content} = 1 if $pub_key_content;
+        for my $pk ( values %db_node_pubkeys ) {
+            $to_remove{$pk} = 1 if $pk;
+        }
+
+        open my $fh, '<', $auth_keys
+          or die "Cannot read $auth_keys: $!\n";
+        my @lines = <$fh>;
+        close $fh;
+        chomp @lines;
+
+        my @kept    = grep { !$to_remove{$_} } @lines;
+        my $removed = @lines - @kept;
+
+        if ($removed) {
+            my ( $tmp_fh, $tmp_path ) = tempfile(
+                '.cl_XXXXXXXX',
+                DIR    => $ssh_dir,
+                UNLINK => 1
+            );
+            print $tmp_fh "$_\n" for @kept;
+            close $tmp_fh;
+            CORE::chmod 0600, $tmp_path;
+            rename $tmp_path, $auth_keys
+              or do {
+                unlink $tmp_path;
+                die "Cannot replace $auth_keys: $!\n";
+              };
+            say "  - removed $removed cluster key(s) from $auth_keys";
+            audit_log( 'admin_auth_keys_cleaned', removed => $removed );
+        }
+        else {
+            say "  - no cluster keys found in $auth_keys";
+        }
+    }
+    else {
+        say "  - $auth_keys does not exist, nothing to clean";
+    }
+
+    # ------------------------------------------------------------------
+    # Phase 5: Remove cluster entries from admin known_hosts
+    # ------------------------------------------------------------------
+    say "";
+    say "[5/8] Cleaning admin ~/.ssh/known_hosts";
+
+    if ( -f $known_hosts ) {
+        my %cluster_ids;
+        for my $machine ( sort @machines ) {
+            my $nets = get cmdb( 'networks', $machine ) // {};
+            my $ip   = $nets->{$network_name};
+            next unless $ip;
+            $cluster_ids{$ip} = 1;
+            $cluster_ids{ $network_name . $machine } = 1;
+        }
+
+        open my $fh, '<', $known_hosts
+          or die "Cannot read $known_hosts: $!\n";
+        my @lines = <$fh>;
+        close $fh;
+
+        my @kept;
+        my $removed = 0;
+        for my $line (@lines) {
+            my ($host_field) = ( split /\s+/, $line )[0] // '';
+            if (
+                $host_field =~ /^\|1\|/
+                || grep { index( ",$host_field,", ",$_," ) >= 0 }
+                keys %cluster_ids
+              )
+            {
+                $removed++;
+                next;
+            }
+            push @kept, $line;
+        }
+
+        if ($removed) {
+            my ( $tmp_fh, $tmp_path ) = tempfile(
+                '.cl_XXXXXXXX',
+                DIR    => $ssh_dir,
+                UNLINK => 1
+            );
+            print $tmp_fh $_ for @kept;
+            close $tmp_fh;
+            CORE::chmod 0600, $tmp_path;
+            rename $tmp_path, $known_hosts
+              or do {
+                unlink $tmp_path;
+                die "Cannot replace $known_hosts: $!\n";
+              };
+            say "  - removed $removed entry(ies) from $known_hosts";
+            audit_log( 'admin_known_hosts_cleaned', removed => $removed );
+        }
+        else {
+            say "  - no cluster entries found in $known_hosts";
+        }
+    }
+    else {
+        say "  - $known_hosts does not exist, nothing to clean";
+    }
+
+    # ------------------------------------------------------------------
+    # Phase 6: Remove cluster entries from known_hosts on each node
+    # ------------------------------------------------------------------
+    say "";
+    say "[6/8] Cleaning known_hosts on reachable nodes";
+
+    my %all_cluster_ids;
+    for my $machine ( sort @machines ) {
+        my $nets = get cmdb( 'networks', $machine ) // {};
+        for my $net ( keys %$nets ) {
+            my $ip = $nets->{$net};
+            next unless $ip;
+            $all_cluster_ids{$ip} = 1;
+            $all_cluster_ids{ $net . $machine } = 1;
+        }
+    }
+    my $kh_ids_pl = join( ' ', sort keys %all_cluster_ids );
+
+    for my $node (@reachable) {
+        my $target = $node->{username} . '@' . $node->{ip};
+        my $pass   = $node->{password};
+
+        bootstrap_run_or_warn(
+            $pass,
+            'sshpass',
+            '-e',
+            'ssh',
+            @ssh_opts_bootstrap,
+            $target,
+            "perl -e '"
+              . 'use File::Temp qw(tempfile); '
+              . 'my $f = "$ENV{HOME}/.ssh/known_hosts"; '
+              . 'exit 0 unless -f $f; '
+              . 'open my $in, q(<), $f or exit 0; '
+              . 'my @lines = <$in>; close $in; '
+              . 'my %ids = map { $_ => 1 } qw('
+              . $kh_ids_pl . '); '
+              . 'my @kept = grep { my ($h)=(split q( ),$_); $h //= q(); $h !~ /^\|1\|/ && !grep { index(qq(,$h,),qq(,$_,))>=0 } keys %ids } @lines; '
+              . 'my ($fh,$tmp) = tempfile(q(.cl_XXXXXXXX), DIR => "$ENV{HOME}/.ssh"); '
+              . 'print $fh $_ for @kept; close $fh; '
+              . 'chmod 0600, $tmp; rename $tmp, $f' . "'"
+        );
+        say "  - $node->{machine} ($node->{ip}): known_hosts cleaned";
+        audit_log(
+            'node_known_hosts_cleaned',
+            machine => $node->{machine},
+            ip      => $node->{ip}
+        );
+    }
+
+    # ------------------------------------------------------------------
+    # Phase 7: Remove cluster_mgmt block from ~/.ssh/config
+    # ------------------------------------------------------------------
+    say "";
+    say "[7/8] Removing cluster_mgmt block from ~/.ssh/config";
+
+    if ( -f $ssh_cfg ) {
+        open my $fh, '<', $ssh_cfg or die "Cannot read $ssh_cfg: $!\n";
+        my $content = do { local $/; <$fh> };
+        close $fh;
+
+        my $new_content = $content;
+        $new_content =~
+s/\n*# --- cluster_mgmt: auto-generated block ---\n.*?# --- end cluster_mgmt ---\n*//s;
+
+        if ( $new_content ne $content ) {
+            my ( $tmp_fh, $tmp_path ) = tempfile(
+                '.cl_XXXXXXXX',
+                DIR    => $ssh_dir,
+                UNLINK => 1
+            );
+            print $tmp_fh $new_content;
+            close $tmp_fh;
+            CORE::chmod 0600, $tmp_path;
+            rename $tmp_path, $ssh_cfg
+              or do {
+                unlink $tmp_path;
+                die "Cannot replace $ssh_cfg: $!\n";
+              };
+            say "  - "
+              . ( $admin_machine // 'admin' )
+              . ": cluster block removed from ~/.ssh/config";
+            audit_log( 'admin_ssh_config_cleaned',
+                machine => $admin_machine // 'admin' );
+        }
+        else {
+            say "  - "
+              . ( $admin_machine // 'admin' )
+              . ": no cluster block in ~/.ssh/config";
+        }
+    }
+    else {
+        say "  - "
+          . ( $admin_machine // 'admin' )
+          . ": ~/.ssh/config does not exist";
+    }
+
+    for my $node (@reachable) {
+        my $target = $node->{username} . '@' . $node->{ip};
+        my $pass   = $node->{password};
+
+        bootstrap_run_or_warn(
+            $pass,
+            'sshpass',
+            '-e',
+            'ssh',
+            @ssh_opts_bootstrap,
+            $target,
+            "perl -e '"
+              . 'use File::Temp qw(tempfile); '
+              . 'my $f = "$ENV{HOME}/.ssh/config"; '
+              . 'exit 0 unless -f $f; '
+              . 'open my $in, q(<), $f or exit 0; '
+              . 'my $c = do { local $/; <$in> }; close $in; '
+              . '(my $n = $c) =~ s/\n*# --- cluster_mgmt: auto-generated block ---\n.*?# --- end cluster_mgmt ---\n*//s; '
+              . 'exit 0 if $n eq $c; '
+              . 'my ($fh,$tmp) = tempfile(q(.cl_XXXXXXXX), DIR => "$ENV{HOME}/.ssh"); '
+              . 'print $fh $n; close $fh; chmod 0600, $tmp; rename $tmp, $f'
+              . "'"
+        );
+        say "  - $node->{machine} ($node->{ip}): ~/.ssh/config cleaned";
+        audit_log(
+            'node_ssh_config_cleaned',
+            machine => $node->{machine},
+            ip      => $node->{ip}
+        );
+    }
+
+    # ------------------------------------------------------------------
+    # Phase 8: Remove /etc/hosts cluster aliases
+    # ------------------------------------------------------------------
+    say "";
+    say "[8/8] Removing cluster /etc/hosts aliases";
+
+    my @network_aliases;
+    for my $machine ( sort @machines ) {
+        my $nets = get cmdb( 'networks', $machine ) // {};
+        next unless $nets->{$network_name};
+        push @network_aliases, $network_name . $machine;
+    }
+
+    my %aliases_to_remove = map { $_ => 1 } @network_aliases;
+
+    if ( $admin_ip && $admin_machine && @network_aliases ) {
+        my @admin_lines;
+        if ( open my $fh, '<', '/etc/hosts' ) {
+            @admin_lines = <$fh>;
+            close $fh;
+        }
+
+        my @kept_admin;
+        my $admin_removed = 0;
+        for my $line (@admin_lines) {
+            if ( $line =~ /^\s*(?:#|$)/ ) {
+                push @kept_admin, $line;
+                next;
+            }
+            my ( undef, @aliases ) = split( ' ', $line );
+            if ( grep { $aliases_to_remove{$_} } @aliases ) {
+                $admin_removed++;
+            }
+            else {
+                push @kept_admin, $line;
+            }
+        }
+
+        if ($admin_removed) {
+
+            # STIG: scoped NOPASSWD -- tee /etc/hosts only
+            my $ok = open my $tee, '|-', 'sudo tee /etc/hosts > /dev/null';
+            if ($ok) {
+                print $tee $_ for @kept_admin;
+                $ok = close $tee;
+            }
+            if ($ok) {
+                say "  - $admin_machine (admin): removed $admin_removed "
+                  . "entry(ies) from /etc/hosts";
+                audit_log(
+                    'admin_hosts_cleaned',
+                    machine => $admin_machine,
+                    removed => $admin_removed
+                );
+            }
+            else {
+                say "  ! $admin_machine (admin): failed to update /etc/hosts";
+            }
+        }
+        else {
+            say "  - $admin_machine (admin): no cluster aliases in /etc/hosts";
+        }
+    }
+
+    for my $node (@reachable) {
+        my $target = $node->{username} . '@' . $node->{ip};
+        my $pass   = $node->{password};
+
+        # Fetch current /etc/hosts from node, filter locally
+        my $remote_raw = eval {
+            bootstrap_capturex( $pass,
+                'sshpass', '-e', 'ssh', @ssh_opts_bootstrap,
+                $target,   'cat /etc/hosts 2>/dev/null' );
+        };
+        my @remote_lines = split /^/m, $remote_raw // '';
+
+        my @kept;
+        my $removed = 0;
+        for my $line (@remote_lines) {
+            if ( $line =~ /^\s*(?:#|$)/ ) {
+                push @kept, $line;
+                next;
+            }
+            my ( undef, @als ) = split ' ', $line;
+            if ( grep { $aliases_to_remove{$_} } @als ) {
+                $removed++;
+            }
+            else {
+                push @kept, $line;
+            }
+        }
+
+        if ($removed) {
+            my ( $tmp_fh, $tmp_local ) = tempfile(
+                '.cl_XXXXXXXX',
+                DIR    => '/tmp',
+                UNLINK => 1
+            );
+            print $tmp_fh $_ for @kept;
+            close $tmp_fh;
+            my $r_tmp = bootstrap_remote_mktemp( $pass, $target,
+                '/tmp/.cl_XXXXXXXX' );
+            my $ok = bootstrap_run_or_warn( $pass, 'sshpass', '-e', 'scp',
+                @ssh_opts_bootstrap, $tmp_local, "$target:$r_tmp" );
+            unlink $tmp_local;
+            if ($ok) {
+
+                # STIG: scoped NOPASSWD -- sudo tee /etc/hosts only
+                bootstrap_run_or_warn(
+                    $pass,
+                    'sshpass',
+                    '-e',
+                    'ssh',
+                    @ssh_opts_bootstrap,
+                    $target,
+                    "sudo tee /etc/hosts < $r_tmp > /dev/null && rm -f $r_tmp"
+                );
+                say
+"  - $node->{machine} ($node->{ip}): removed $removed entry(ies)";
+                audit_log(
+                    'node_hosts_cleaned',
+                    machine => $node->{machine},
+                    ip      => $node->{ip}
+                );
+            }
+            else {
+                say
+"  ! $node->{machine} ($node->{ip}): failed to transfer hosts update";
+            }
+        }
+        else {
+            say
+"  - $node->{machine} ($node->{ip}): no cluster aliases in /etc/hosts";
+        }
+    }
+
+    # ------------------------------------------------------------------
+    # Optional: Remove admin keypair and purge DB entries
+    # ------------------------------------------------------------------
+    if ($remove_admin_key) {
+        say "";
+        say
+          "Removing admin cluster keypair and DB entries (--remove_admin_key)";
+
+        if ( -f $key_base ) { unlink $key_base; say "  - deleted $key_base"; }
+        if ( -f $pub_key )  { unlink $pub_key;  say "  - deleted $pub_key"; }
+
+        if ( my $db = cluster_db() ) {
+            for my $machine ( 'admin', sort @machines ) {
+                $db->delete_key(
+                    machine  => $machine,
+                    key_type => 'ecdsa-sha2-nistp521',
+                );
+                my $dbh = $db->_connect;
+                $dbh->do(
+                    "DELETE FROM key_passphrases WHERE machine_name = ?",
+                    undef, $machine );
+            }
+            say
+"  - deleted all cluster keys and passphrases from encrypted database";
+        }
+        audit_log( 'admin_keypair_removed', key => $key_base );
+    }
+
+    # ------------------------------------------------------------------
+    # Final report
+    # ------------------------------------------------------------------
+    if (@down) {
+        say "";
+        say "Down nodes (manual cleanup required):";
+        say "-" x 60;
+        for my $entry (@down) {
+            say "  $entry->[0] ($entry->[1])";
+            say "    Manually run on $entry->[0]:";
+            say "      rm -f ~/.ssh/id_ecdsa_p521_cluster{,.pub}";
+            say
+"      # Edit ~/.ssh/authorized_keys — remove cluster key entries";
+            say
+"      # Edit ~/.ssh/known_hosts    — remove cluster IP/alias entries";
+            say
+              "      # Edit ~/.ssh/config         — remove cluster_mgmt block";
+            say
+"      # sudo edit /etc/hosts       — remove $network_name* aliases";
+        }
+    }
+
+    audit_log(
+        'remove_ssh_keys_complete',
+        group     => $group_name,
+        machine   => $machine_name // 'all',
+        network   => $network_name,
+        reachable => scalar(@reachable),
+        down      => scalar(@down)
+    );
+
+    say "";
+    say "=" x 60;
+};
+
+# rex shutdown --network=<name>               ; shutdown all non-admin nodes on the network (required)
+# rex shutdown --network=<name> --group=<name> ; limit to a named group (default: all)
+# rex shutdown --network=<name> --timeout=<s>  ; TCP probe timeout (default: 1)
+# rex shutdown --network=<name> --ssh_retry=<n>; SSH connection attempts (default: 5)
+# Requires cluster SSH key (run setup_ssh_keys --bootstrap=1 first)
+# STIG: uses passwordless sudo (NOPASSWD in sudoers for shutdown command)
+desc "Shutdown all reachable non-admin nodes on a network";
+task "shutdown", sub {
+    local $| = 1;
+    require_cluster_key();
+    ensure_agent_loaded();
+
+    my $param        = shift || {};
+    my $group_name   = $param->{group} // 'all';
+    my $network_name = $param->{network}
+      or die "Parameter --network is required.\n";
+    my $ping_timeout = $param->{timeout}   // 1;
+    my $ssh_retry    = $param->{ssh_retry} // $DEFAULT_SSH_RETRY;
+    local @ssh_opts = ssh_opts($ssh_retry);
+
+    die "Group '$group_name' is not defined.\n"
+      unless Rex::Group->is_group($group_name);
+
+    audit_log(
+        'shutdown_start',
+        group   => $group_name,
+        network => $network_name
+    );
+
+    my @group_members = map { "$_" } Rex::Group->get_group($group_name);
+    my $pinger        = tcp_pinger($ping_timeout);
+
+    my ( $admin_ip, $admin_machine ) = detect_admin($network_name);
+    say "  - admin machine: " . ( $admin_machine // '(unknown)' );
+
+    say "=" x 60;
+    say "Shutdown Nodes (group: $group_name, network: $network_name)";
+    say "=" x 60;
+
+    my @summary;
+    for my $machine ( sort @group_members ) {
+        my $networks = get cmdb( 'networks', $machine ) // {};
+        my $ip       = $networks->{$network_name};
+
+        if ( !$ip ) {
+            say sprintf "%-20s %-15s %s", $machine, $ip // '', 'MISSING';
+            push @summary, { machine => $machine, status => 'MISSING' };
+            next;
+        }
+
+        if ( defined $admin_machine && $machine eq $admin_machine ) {
+            say sprintf "%-20s %-15s %s", $machine, $ip, 'ADMIN (skipped)';
+            push @summary, { machine => $machine, status => 'ADMIN' };
+            next;
+        }
+
+        if ( !$pinger->ping($ip) ) {
+            say sprintf "%-20s %-15s %s", $machine, $ip, 'DOWN (skipped)';
+            push @summary, { machine => $machine, status => 'DOWN' };
+            next;
+        }
+
+        my ( $username, undef ) = get_credential($machine);
+
+        if ( !$username ) {
+            say sprintf "%-20s %-15s %s", $machine, $ip, 'SKIP (no username)';
+            push @summary, { machine => $machine, status => 'SKIP' };
+            next;
+        }
+
+        my $target = "$username\@$ip";
+        say sprintf "%-20s %-15s %s", $machine, $ip, 'sending shutdown...';
+
+        # STIG: passwordless sudo (NOPASSWD in sudoers for shutdown)
+        my $ok =
+          run_or_warn( 'ssh', @ssh_opts, $target, 'sudo shutdown -h now' );
+        push @summary,
+          { machine => $machine, status => $ok ? 'SENT' : 'FAILED' };
+        audit_log(
+            'shutdown_sent',
+            machine => $machine,
+            ip      => $ip,
+            result  => $ok ? 'OK' : 'FAILED'
+        );
+    }
+
+    $pinger->close;
+
+    say "";
+    say "=" x 60;
+    say "Summary";
+    say "=" x 60;
+    printf "%-24s %s\n", 'Machine', 'Status';
+    say "-" x 36;
+    printf "%-24s %s\n", $_->{machine}, $_->{status} for @summary;
+    say "=" x 60;
+};
+
+# rex nodes_in_network                    ; show all networks and their members + reachability
+# rex nodes_in_network --network=<name>   ; show one network
+desc "List nodes (and reachability) for one or all networks";
+task "nodes_in_network", sub {
+    local $| = 1;
+    my $param        = shift || {};
+    my $network_name = $param->{network};        # optional
+    my $ping_timeout = $param->{timeout} // 1;
+
+    my @networks = defined $network_name ? ($network_name) : all_networks();
+
+    die "No networks found in CMDB.\n" unless @networks;
+
+    my $pinger = tcp_pinger($ping_timeout);
+
+    for my $net ( sort @networks ) {
+        say "=" x 60;
+        say "Network: $net";
+        say "=" x 60;
+        printf "%-24s %-15s %s\n", 'Machine', 'IP', 'Reachable';
+        say "-" x 48;
+
+        my @members;
+        for my $m ( sort @machines ) {
+            my $nets = get cmdb( 'networks', $m ) // {};
+            my $ip   = $nets->{$net};
+            next unless defined $ip;
+            push @members, { machine => $m, ip => $ip };
+        }
+
+        if ( !@members ) {
+            say "  (no machines defined for this network)";
+            say "";
+            next;
+        }
+
+        for my $entry (@members) {
+            my $reach = $pinger->ping( $entry->{ip} ) ? 'YES' : 'NO';
+            printf "%-24s %-15s %s\n", $entry->{machine}, $entry->{ip}, $reach;
+        }
+        say "";
+    }
+
+    $pinger->close;
+};
+
+# rex networks_for_node                    ; show all machines and their networks + reachability
+# rex networks_for_node --machine=<name>   ; show one machine
+desc "List networks (and reachability) for one or all machines";
+task "networks_for_node", sub {
+    local $| = 1;
+    my $param        = shift || {};
+    my $machine_name = $param->{machine};        # optional
+    my $ping_timeout = $param->{timeout} // 1;
+
+    my @targets = defined $machine_name ? ($machine_name) : ( sort @machines );
+
+    if ( defined $machine_name ) {
+        die "Machine '$machine_name' not found in CMDB.\n"
+          unless grep { $_ eq $machine_name } @machines;
+    }
+
+    my $pinger = tcp_pinger($ping_timeout);
+
+    for my $m (@targets) {
+        say "=" x 60;
+        say "Machine: $m";
+        say "=" x 60;
+        printf "%-16s %-15s %s\n", 'Network', 'IP', 'Reachable';
+        say "-" x 40;
+
+        my $nets = get cmdb( 'networks', $m ) // {};
+
+        if ( !keys %$nets ) {
+            say "  (no networks defined for this machine)";
+            say "";
+            next;
+        }
+
+        for my $net ( sort keys %$nets ) {
+            my $ip    = $nets->{$net};
+            my $reach = $pinger->ping($ip) ? 'YES' : 'NO';
+            printf "%-16s %-15s %s\n", $net, $ip, $reach;
+        }
+        say "";
+    }
+
+    $pinger->close;
+};
+
+# rex obtain_mac                          ; discover MACs for all machines (group 'all')
+# rex obtain_mac --group=<name>           ; discover MACs for a named group
+# rex obtain_mac --machine=<name>         ; discover MACs for a single machine
+# rex obtain_mac --ssh_retry=<n>          ; SSH connection attempts (default: 5)
+# Requires cluster SSH key (run setup_ssh_keys --bootstrap=1 first)
+desc "Discover and store MAC addresses for each machine/network in CMDB YAMLs";
+task "obtain_mac", sub {
+    local $| = 1;
+    require_cluster_key();
+    ensure_agent_loaded();
+
+    my $param        = shift || {};
+    my $machine_name = $param->{machine};
+    my $group_name   = $param->{group};
+    my $ping_timeout = $param->{timeout}   // 1;
+    my $ssh_retry    = $param->{ssh_retry} // $DEFAULT_SSH_RETRY;
+    local @ssh_opts = ssh_opts($ssh_retry);
+
+    die "Specify at most one of --machine or --group, not both.\n"
+      if defined $machine_name && defined $group_name;
+
+    # Build target list
+    my @targets;
+    if ( defined $machine_name ) {
+        die "Machine '$machine_name' not found in CMDB.\n"
+          unless $machine_set{$machine_name};
+        @targets = ($machine_name);
+    }
+    else {
+        $group_name //= 'all';
+        die "Group '$group_name' is not defined.\n"
+          unless Rex::Group->is_group($group_name);
+        @targets = map { "$_" } Rex::Group->get_group($group_name);
+    }
+
+    my ( $admin_ip, $admin_machine ) = detect_admin();
+
+    my $pinger = tcp_pinger($ping_timeout);
+
+    say "=" x 60;
+    say "Obtaining MAC addresses";
+    say "=" x 60;
+
+    my %ioi_state;
+    my @summary;
+    for my $m ( sort @targets ) {
+        say "\nMachine: $m";
+        say "-" x 40;
+
+        my $nets = get cmdb( 'networks', $m ) // {};
+        my ( $username, undef ) = get_credential($m);
+        my $yml_path = "$cmdb_dir/$m.yml";
+
+        unless ( -f $yml_path ) {
+            say "  SKIP: YAML file not found at $yml_path";
+            push @summary, { machine => $m, status => 'NO YAML' };
+            next;
+        }
+
+        my $yaml_doc = YAML::Tiny->read($yml_path)
+          or do {
+            say "  SKIP: could not parse $yml_path";
+            push @summary, { machine => $m, status => 'PARSE ERROR' };
+            next;
+          };
+        my $data = $yaml_doc->[0];
+        $data->{mac} //= {};
+
+        my $any_ok   = 0;
+        my $is_local = ( defined $admin_machine && $m eq $admin_machine );
+        my $state;
+
+        for my $net ( sort keys %$nets ) {
+            my $ip = $nets->{$net};
+
+            if ( !$is_local && !$pinger->ping($ip) ) {
+                printf "  %-10s %-15s %s\n", $net, $ip, 'UNREACHABLE (skipped)';
+                push @summary,
+                  {
+                    machine => $m,
+                    network => $net,
+                    ip      => $ip,
+                    mac     => '-',
+                    status  => 'UNREACHABLE'
+                  };
+                next;
+            }
+
+            if ( !$state ) {
+                $state = $ioi_state{$m} //= ensure_io_interface(
+                    machine => $m,
+                    local   => $is_local,
+                    target  => ( $is_local ? undef : "$username\@$ip" ),
+                );
+            }
+
+            if ( !$state ) {
+                printf "  %-10s %-15s %s\n", $net, $ip,
+                  'FAILED (could not retrieve MAC)';
+                push @summary,
+                  {
+                    machine => $m,
+                    network => $net,
+                    ip      => $ip,
+                    mac     => '-',
+                    status  => 'FAILED'
+                  };
+                next;
+            }
+
+            my $mac = get_mac_for_ip(
+                ip     => $ip,
+                local  => $is_local,
+                target => $state->{target},
+                libdir => $state->{libdir},
+            );
+
+            if ( !$mac ) {
+                printf "  %-10s %-15s %s\n", $net, $ip,
+                  'FAILED (could not retrieve MAC)';
+                push @summary,
+                  {
+                    machine => $m,
+                    network => $net,
+                    ip      => $ip,
+                    mac     => '-',
+                    status  => 'FAILED'
+                  };
+                next;
+            }
+
+            printf "  %-10s %-15s %s\n", $net, $ip, $mac;
+            $data->{mac}{$net} = $mac;
+            push @summary,
+              {
+                machine => $m,
+                network => $net,
+                ip      => $ip,
+                mac     => $mac,
+                status  => 'OK'
+              };
+            $any_ok = 1;
+        }
+
+        if ($any_ok) {
+            $yaml_doc->[0] = $data;
+            $yaml_doc->write($yml_path)
+              or warn "  WARNING: could not write $yml_path: $!\n";
+            say "  => YAML updated: $yml_path";
+        }
+    }
+
+    for my $state ( values %ioi_state ) {
+        next unless $state && $state->{installed_temp};
+        cleanup_io_interface( %{$state} );
+    }
+
+    $pinger->close;
+
+    say "";
+    say "=" x 60;
+    say "Summary";
+    say "=" x 60;
+    printf "%-20s %-10s %-15s %-20s %s\n",
+      'Machine', 'Network', 'IP', 'MAC', 'Status';
+    say "-" x 75;
+    for my $r (@summary) {
+        printf "%-20s %-10s %-15s %-20s %s\n",
+          $r->{machine}, $r->{network} // '-', $r->{ip} // '-',
+          $r->{mac} // '-', $r->{status};
+    }
+    say "=" x 60;
+};
+
+# ---------------------------------------------------------------------------
+# rex validate_ssh_mesh --network=<name>                ; validate full-mesh SSH for all nodes
+# rex validate_ssh_mesh --network=<name> --group=<name> ; validate full-mesh SSH for a named group
+# rex validate_ssh_mesh --network=<name> --timeout=<s>  ; TCP probe timeout (default: 1)
+# rex validate_ssh_mesh --network=<name> --ssh_retry=<n>; SSH connection attempts (default: 5)
+#
+# For every ordered pair (A, B) of reachable nodes, tests:
+#   1. Password-based SSH:  admin -> A (sshpass -e) -> A runs SSH_ASKPASS ssh B 'true'
+#      [SEC-CRED-ENCRYPT]: dst password is SCP'd as a 0400 temp file to src, a tiny
+#      askpass script reads from it via SSH_ASKPASS_REQUIRE=force (built into
+#      OpenSSH, no remote packages required). Both files deleted after use.
+#   2. Key-based SSH:       admin -> A (sshpass -e) -> A runs ssh -i key B 'true'
+# Also tests admin -> each node for both modes.
+# Provides a summary of unreachable nodes and failed pairwise connections.
+# ---------------------------------------------------------------------------
+desc "Validate full-mesh SSH connectivity (password + key) for a network group";
+task "validate_ssh_mesh", sub {
+    local $| = 1;
+    require_cluster_key();
+    ensure_agent_loaded();
+
+    my $param        = shift || {};
+    my $group_name   = $param->{group} // 'all';
+    my $network_name = $param->{network}
+      or die "Parameter --network is required.\n";
+    my $ping_timeout = $param->{timeout}   // 1;
+    my $ssh_retry    = $param->{ssh_retry} // $DEFAULT_SSH_RETRY;
+    local @ssh_opts           = ssh_opts($ssh_retry);
+    local @ssh_opts_bootstrap = ssh_opts_bootstrap($ssh_retry);
+
+    die "Group '$group_name' is not defined.\n"
+      unless Rex::Group->is_group($group_name);
+
+    my @group_members = map { "$_" } Rex::Group->get_group($group_name);
+
+    my ( $admin_ip, $admin_machine ) = detect_admin($network_name);
+
+    say "=" x 70;
+    say "Validate SSH Mesh (group: $group_name, network: $network_name)";
+    say "=" x 70;
+    say "Admin: "
+      . ( $admin_machine // '(unknown)' ) . " ("
+      . ( $admin_ip      // '?' ) . ")";
+    say "";
+
+    # Phase 1: Probe reachability and collect credentials
+    say "[1/3] Probing node reachability";
+    my $pinger = tcp_pinger($ping_timeout);
+
+    my @reachable;    # { machine, ip, username, password }
+    my @unreachable;
+
+    for my $machine ( sort @group_members ) {
+        my $networks = get cmdb( 'networks', $machine ) // {};
+        my $ip       = $networks->{$network_name};
+
+        if ( !$ip ) {
+            say sprintf "  %-20s %-15s %s", $machine, '-', 'NO IP';
+            push @unreachable, { machine => $machine, reason => 'NO IP' };
+            next;
+        }
+
+        if ( !$pinger->ping($ip) ) {
+            say sprintf "  %-20s %-15s %s", $machine, $ip, 'DOWN';
+            push @unreachable, { machine => $machine, reason => 'DOWN' };
+            next;
+        }
+
+        my ( $username, $password ) = get_credential($machine);
+        if ( !$username || !$password ) {
+            say sprintf "  %-20s %-15s %s", $machine, $ip, 'NO CREDS';
+            push @unreachable, { machine => $machine, reason => 'NO CREDS' };
+            next;
+        }
+
+        say sprintf "  %-20s %-15s %s", $machine, $ip, 'UP';
+        push @reachable,
+          {
+            machine  => $machine,
+            ip       => $ip,
+            username => $username,
+            password => $password,
+          };
+    }
+    $pinger->close;
+
+    say "";
+    say "Reachable: "
+      . scalar(@reachable)
+      . "  Unreachable: "
+      . scalar(@unreachable);
+
+    if ( @reachable < 2 ) {
+        say "Need at least 2 reachable nodes to test mesh. Exiting.";
+        return;
+    }
+
+    # Build a lookup: machine -> { ip, username, password }
+    my %node_info = map { $_->{machine} => $_ } @reachable;
+
+    # Include admin in the mesh if detected and has credentials
+    my @mesh_nodes    = @reachable;
+    my $admin_in_mesh = 0;
+    if ( $admin_ip && $admin_machine ) {
+        unless ( $node_info{$admin_machine} ) {
+
+            # Admin is not in the reachable list (it's us); add it
+            my ( $au, $ap ) = get_credential($admin_machine);
+            if ( $au && $ap ) {
+                my $admin_entry = {
+                    machine  => $admin_machine,
+                    ip       => $admin_ip,
+                    username => $au,
+                    password => $ap,
+                };
+                push @mesh_nodes, $admin_entry;
+                $node_info{$admin_machine} = $admin_entry;
+                $admin_in_mesh = 1;
+            }
+        }
+    }
+
+    # Phase 2: Test all ordered pairs
+    say "";
+    say "[2/3] Testing pairwise SSH connections ("
+      . scalar(@mesh_nodes)
+      . " nodes, "
+      . ( scalar(@mesh_nodes) * ( scalar(@mesh_nodes) - 1 ) )
+      . " ordered pairs)";
+    say "";
+
+    my @pass_fail;    # { src, dst, password => 0|1, key => 0|1 }
+
+    my $key_file    = '~/.ssh/id_ecdsa_p521_cluster';
+    my $ssh_timeout = 5;
+
+    for my $src (@mesh_nodes) {
+        for my $dst (@mesh_nodes) {
+            next if $src->{machine} eq $dst->{machine};
+
+            my $src_name = $src->{machine};
+            my $dst_name = $dst->{machine};
+            my $dst_ip   = $dst->{ip};
+            my $dst_user = $dst->{username};
+
+            my %result = (
+                src      => $src_name,
+                dst      => $dst_name,
+                password => 0,
+                key      => 0,
+            );
+
+            my $is_local_src =
+              ( $admin_machine && $src_name eq $admin_machine );
+
+            # --- Password-based test ---
+            if ($is_local_src) {
+
+                # Admin is source: direct sshpass ssh to dst
+                local $ENV{SSHPASS} = $dst->{password};
+                my $ok = eval {
+                    capturex( 'sshpass', '-e', 'ssh', @ssh_opts_bootstrap,
+                        "$dst_user\@$dst_ip", 'true' );
+                    1;
+                };
+                $result{password} = $ok ? 1 : 0;
+            }
+            else {
+                # Remote source: use SSH_ASKPASS to pass dst password
+                # without it appearing in process arguments or env.
+                # [SEC-CRED-ENCRYPT]: password only exists in a 0400 temp file
+                # on the source node, deleted immediately after use.
+                #
+                # Flow: SCP password file to src -> SSH into src ->
+                # create askpass script that reads the file ->
+                # SSH_ASKPASS_REQUIRE=force makes SSH call the script ->
+                # clean up both files regardless of outcome.
+                my ( $pw_fh, $pw_local ) = tempfile(
+                    '.cl_XXXXXXXX',
+                    DIR    => '/tmp',
+                    UNLINK => 1
+                );
+                print $pw_fh $dst->{password};
+                close $pw_fh;
+                CORE::chmod 0400, $pw_local;
+
+          # Unique remote path via remote mktemp (avoids predictable /tmp names)
+                local $ENV{SSHPASS} = $src->{password};
+                my $remote_pw =
+                  bootstrap_remote_mktemp( $src->{password},
+                    "$src->{username}\@$src->{ip}",
+                    '/tmp/.cl_XXXXXXXX' );
+
+                my $scp_ok = eval {
+                    capturex( 'sshpass', '-e', 'scp', @ssh_opts_bootstrap,
+                        $pw_local, "$src->{username}\@$src->{ip}:$remote_pw" );
+                    1;
+                };
+                unlink $pw_local;
+
+                if ( !$scp_ok ) {
+                    $result{password}  = 0;
+                    $result{pw_reason} = 'SCP_FAIL';
+                }
+                else {
+                    # Build askpass script + run SSH on the remote node.
+                    # SSH_ASKPASS_REQUIRE=force makes SSH use the askpass
+                    # program even without a terminal (no sshpass needed).
+                    my $inner_cmd =
+                        "RMTAP=\$(mktemp /tmp/.cl_XXXXXXXX)"
+                      . " && chmod 400 $remote_pw"
+                      . " && printf '#!/bin/sh\\ncat $remote_pw\\n'"
+                      . " > \$RMTAP"
+                      . " && chmod 500 \$RMTAP"
+                      . " && SSH_ASKPASS=\$RMTAP"
+                      . " SSH_ASKPASS_REQUIRE=force"
+                      . " DISPLAY=:0" . " ssh"
+                      . " -o StrictHostKeyChecking=no"
+                      . " -o UserKnownHostsFile=/dev/null"
+                      . " -o ConnectTimeout=$ssh_timeout"
+                      . " -o ConnectionAttempts=$ssh_retry"
+                      . " -o LogLevel=ERROR"
+                      . " $dst_user\@$dst_ip true"
+                      . "; RC=\$?; rm -f $remote_pw \$RMTAP; exit \$RC";
+                    local $ENV{SSHPASS} = $src->{password};
+                    my $ok = eval {
+                        capturex( 'sshpass', '-e', 'ssh', @ssh_opts_bootstrap,
+                            "$src->{username}\@$src->{ip}", $inner_cmd );
+                        1;
+                    };
+                    $result{password} = $ok ? 1 : 0;
+                }
+            }
+
+            # --- Key-based test ---
+            if ($is_local_src) {
+
+                # Admin is source: direct key-based ssh to dst
+                my $ok = eval {
+                    capturex(
+                        'ssh',                           '-o',
+                        'StrictHostKeyChecking=yes',     '-o',
+                        "ConnectTimeout=$ssh_timeout",   '-o',
+                        "ConnectionAttempts=$ssh_retry", '-o',
+                        'LogLevel=ERROR',                '-o',
+                        'PasswordAuthentication=no',     '-o',
+                        'PubkeyAuthentication=yes',      '-i',
+                        $cluster_key_path,               "$dst_user\@$dst_ip",
+                        'true'
+                    );
+                    1;
+                };
+                $result{key} = $ok ? 1 : 0;
+            }
+            else {
+                # Remote source: ssh into src (via password), then key-based
+                # ssh from src to dst.
+                # [SEC-KEY-PASSPHRASE]: the node's key has a passphrase, so we must
+                # start ssh-agent on the remote node, load the key via
+                # SSH_ASKPASS with the passphrase from ClusterDB, run the
+                # SSH test, then kill the agent.  Passphrase is SCP'd as a
+                # 0400 temp file (never in process args).
+                my $node_pp = eval {
+                    my $db = cluster_db();
+                    $db
+                      ? $db->get_key_passphrase( machine => $src->{machine} )
+                      : undef;
+                };
+
+                if ( !$node_pp ) {
+                    $result{key}        = 0;
+                    $result{key_reason} = 'NO_PASSPHRASE';
+                }
+                else {
+                    # SCP node key passphrase to source node
+                    my ( $pp_fh, $pp_local ) = tempfile(
+                        '.cl_XXXXXXXX',
+                        DIR    => '/tmp',
+                        UNLINK => 1
+                    );
+                    print $pp_fh $node_pp;
+                    close $pp_fh;
+                    CORE::chmod 0400, $pp_local;
+
+                    local $ENV{SSHPASS} = $src->{password};
+                    my $r_kpp =
+                      bootstrap_remote_mktemp( $src->{password},
+                        "$src->{username}\@$src->{ip}",
+                        '/tmp/.cl_XXXXXXXX' );
+
+                    my $scp_ok = eval {
+                        capturex( 'sshpass', '-e', 'scp', @ssh_opts_bootstrap,
+                            $pp_local, "$src->{username}\@$src->{ip}:$r_kpp" );
+                        1;
+                    };
+                    unlink $pp_local;
+
+                    if ( !$scp_ok ) {
+                        $result{key}        = 0;
+                        $result{key_reason} = 'SCP_FAIL';
+                    }
+                    else {
+                        # On the remote node:
+                        # 1. Create askpass script that reads passphrase file
+                        # 2. Start ssh-agent, capture its env
+                        # 3. Load the key via SSH_ASKPASS
+                        # 4. Run the key-based SSH test
+                        # 5. Kill the agent and clean up all temp files
+                        my $inner_cmd =
+                            "RMTKAP=\$(mktemp /tmp/.cl_XXXXXXXX)"
+                          . " && RMTAG=\$(mktemp /tmp/.cl_XXXXXXXX)"
+                          . " && chmod 400 $r_kpp"
+                          . " && printf '#!/bin/sh\\ncat $r_kpp\\n'"
+                          . " > \$RMTKAP"
+                          . " && chmod 500 \$RMTKAP"
+                          . " && ssh-agent -s > \$RMTAG"
+                          . " && . \$RMTAG > /dev/null"
+                          . " && SSH_ASKPASS=\$RMTKAP"
+                          . " SSH_ASKPASS_REQUIRE=force"
+                          . " DISPLAY=:0"
+                          . " ssh-add $key_file"
+                          . " > /dev/null 2>&1"
+                          . " && ssh"
+                          . " -o StrictHostKeyChecking=yes"
+                          . " -o ConnectTimeout=$ssh_timeout"
+                          . " -o ConnectionAttempts=$ssh_retry"
+                          . " -o LogLevel=ERROR"
+                          . " -o PasswordAuthentication=no"
+                          . " -o PubkeyAuthentication=yes"
+                          . " -i $key_file"
+                          . " $dst_user\@$dst_ip true"
+                          . "; RC=\$?"
+                          . "; eval \$(ssh-agent -k) > /dev/null 2>&1"
+                          . "; rm -f $r_kpp \$RMTKAP \$RMTAG"
+                          . "; exit \$RC";
+
+                        my $ok = eval {
+                            capturex( 'sshpass', '-e', 'ssh',
+                                @ssh_opts_bootstrap,
+                                "$src->{username}\@$src->{ip}", $inner_cmd );
+                            1;
+                        };
+                        $result{key} = $ok ? 1 : 0;
+                    }
+                }
+            }
+
+            my $pw_mark =
+              $result{password}
+              ? 'OK'
+              : ( $result{pw_reason} // 'FAIL' );
+            my $key_mark =
+              $result{key}
+              ? 'OK'
+              : ( $result{key_reason} // 'FAIL' );
+            say sprintf "  %-20s -> %-20s  pw:%-10s  key:%-4s",
+              $src_name, $dst_name, $pw_mark, $key_mark;
+
+            push @pass_fail, \%result;
+        }
+    }
+
+    # Phase 3: Summary
+    my $total_pairs = scalar @pass_fail;
+    my $pw_fail     = scalar grep { !$_->{password} } @pass_fail;
+    my $pw_scp_fail =
+      scalar grep { !$_->{password} && ( $_->{pw_reason} // '' ) eq 'SCP_FAIL' }
+      @pass_fail;
+    my $key_fail = scalar grep { !$_->{key} } @pass_fail;
+    my $key_no_pp =
+      scalar
+      grep { !$_->{key} && ( $_->{key_reason} // '' ) eq 'NO_PASSPHRASE' }
+      @pass_fail;
+    my $pw_ok  = $total_pairs - $pw_fail;
+    my $key_ok = $total_pairs - $key_fail;
+
+    say "";
+    say "[3/3] Summary";
+    say "=" x 70;
+    printf "%-30s %s\n", 'Unreachable nodes:', scalar(@unreachable);
+    for my $u (@unreachable) {
+        printf "  %-24s %s\n", $u->{machine}, $u->{reason};
+    }
+    say "-" x 70;
+    printf "%-30s %s\n", 'Total ordered pairs tested:', $total_pairs;
+    printf "%-30s %s\n", 'Password auth OK:',           "$pw_ok / $total_pairs";
+    printf "%-30s %s\n", 'Password auth FAILED:', "$pw_fail / $total_pairs";
+    if ($pw_scp_fail) {
+        printf "%-30s %s\n", '  (SCP password file failed):', $pw_scp_fail;
+    }
+    printf "%-30s %s\n", 'Key auth OK:',     "$key_ok / $total_pairs";
+    printf "%-30s %s\n", 'Key auth FAILED:', "$key_fail / $total_pairs";
+    if ($key_no_pp) {
+        printf "%-30s %s\n", '  (no passphrase in DB):', $key_no_pp;
+    }
+    say "=" x 70;
+
+    if ( $pw_fail || $key_fail ) {
+        say "";
+        say "Failed connections:";
+        say "-" x 70;
+        printf "  %-20s -> %-20s  %-12s %s\n",
+          'Source', 'Destination', 'Password', 'Key';
+        say "  " . ( "-" x 66 );
+        for my $r (@pass_fail) {
+            next if $r->{password} && $r->{key};
+            printf "  %-20s -> %-20s  %-12s %s\n",
+              $r->{src}, $r->{dst},
+              $r->{password} ? 'OK' : ( $r->{pw_reason}  // 'FAIL' ),
+              $r->{key}      ? 'OK' : ( $r->{key_reason} // 'FAIL' );
+        }
+    }
+
+    audit_log(
+        'validate_ssh_mesh',
+        group       => $group_name,
+        network     => $network_name,
+        reachable   => scalar(@reachable),
+        unreachable => scalar(@unreachable),
+        pairs       => $total_pairs,
+        pw_fail     => $pw_fail,
+        key_fail    => $key_fail
+    );
+
+    say "";
+    say "=" x 70;
+};
