@@ -92,7 +92,7 @@ Reverses all `setup_ssh_keys` changes: removes keypairs, the three node-local pa
 - createdatabase/
   - ClusterDB.pm: encrypted database module (AES-256-GCM)
   - init_cluster_db.pl: database initialization and import script
-  - pubkeys/: optional staged public keys to import
+  - pubkeys/: staging area for SSH public key files to import into the encrypted DB. Place `<machine>.pub` files here before running `init_cluster_db.pl`; they are imported automatically. The directory is empty by default and is not required for normal CSV-driven workflows.
   - (git-ignored) cluster_keys.db — encrypted SQLite database
   - (git-ignored) .cluster_db.keyfile — master encryption key
 - system_db_setup/
@@ -322,6 +322,136 @@ rex validate_ssh_mesh --network=labnet
 rex show_known_hosts --network=labnet
 rex rm_dup_hosts --network=labnet
 rex nodes_in_network --network=labnet
+
+---
+
+## Adding New Nodes
+
+There are two paths to add a new node to an existing cluster, depending on whether the node's SSH public key is already known.
+
+### Path 1: CSV-driven (most common)
+
+Use this when you have SSH access to the new node (via password) but its cluster keypair has not been generated yet. The `setup_ssh_keys` task will generate the keypair on the node and capture its passphrase.
+
+**1) Add rows to the CSV files**
+
+Append the new node to `system_db_setup/users_db.csv`:
+
+```
+node-delta,clusteradmin,FakeP@ssw0rd-D4
+```
+
+Append one row per network to `system_db_setup/networks_db.csv`:
+
+```
+labnet,node-delta,10.20.30.14
+```
+
+**2) Regenerate CMDB YAMLs**
+
+```
+perl system_db_setup/generate_cmdb.pl
+```
+
+This creates `cmdb/node-delta.yml` with its network IPs. Existing YAML files are regenerated with current CSV data; any previously stored MAC addresses are preserved.
+
+**3) Import the new credential into the encrypted DB**
+
+```
+perl createdatabase/init_cluster_db.pl \
+  --keyfile createdatabase/.cluster_db.keyfile \
+  --users-csv system_db_setup/users_db.csv
+```
+
+The DB uses upsert logic — existing credentials are updated (with `rotated_at` timestamp), new ones are inserted. No data is lost.
+
+**4) Run setup (no `--rekey` needed)**
+
+```
+cd cluster_ssh_setup
+CLUSTER_DB_KEY="$(cat ../createdatabase/.cluster_db.keyfile)" \
+rex setup_ssh_keys --network=labnet --bootstrap=1
+```
+
+This is fully incremental:
+- Phase 5 generates a keypair only on `node-delta` (existing nodes already have keys and are skipped)
+- Phase 5 collects public keys from **all** reachable nodes (new and existing)
+- Phase 6 adds `node-delta`'s key to every existing node's `authorized_keys`, and adds all existing keys to `node-delta`'s `authorized_keys`; keys already present are not duplicated
+- Phases 7–9 (known_hosts, ssh/config, /etc/hosts) are all idempotent — they skip entries that already exist
+
+To target only the new node (avoids probing all nodes):
+
+```
+CLUSTER_DB_KEY="$(cat ../createdatabase/.cluster_db.keyfile)" \
+rex setup_ssh_keys --network=labnet --bootstrap=1 --machine=node-delta
+```
+
+Note: with `--machine`, only `node-delta` receives peer keys. After this, run the full command (without `--machine`) once so that existing nodes pick up `node-delta`'s key in their `authorized_keys` and `known_hosts`.
+
+### Path 2: Pre-staged public key via `pubkeys/` (two-stage)
+
+Use this when you already have the node's SSH public key (e.g. exported from another system, or copied manually) and want to import it into the encrypted DB before running bootstrap.
+
+**The `createdatabase/pubkeys/` directory**
+
+This directory is a staging area for SSH public key files. Each file must:
+- Be named `<machine-name>.pub` (e.g. `node-delta.pub`)
+- Contain a standard SSH public key line: `<key-type> <base64-key> [comment]`
+
+The directory is empty by default. Place `.pub` files here before running `init_cluster_db.pl`; they are imported automatically.
+
+**1) Place the public key file**
+
+```
+cp /path/to/node-delta-key.pub createdatabase/pubkeys/node-delta.pub
+```
+
+**2) Add rows to the CSV files** (same as Path 1, steps 1–2)
+
+```
+# Append to users_db.csv and networks_db.csv, then:
+perl system_db_setup/generate_cmdb.pl
+```
+
+**3) Import everything into the encrypted DB**
+
+```
+perl createdatabase/init_cluster_db.pl \
+  --keyfile createdatabase/.cluster_db.keyfile \
+  --users-csv system_db_setup/users_db.csv
+```
+
+This imports the `.pub` file from `pubkeys/` (storing the key encrypted with its fingerprint) **and** the credential from the CSV, in a single run.
+
+To import `.pub` files from a different directory, pass `--import <dir>`:
+
+```
+perl createdatabase/init_cluster_db.pl \
+  --keyfile createdatabase/.cluster_db.keyfile \
+  --import /path/to/other/pubkeys
+```
+
+**4) Run setup** (same as Path 1, step 4)
+
+The key imported via `pubkeys/` is stored in the DB for auditing and display (`rex show_keys`). The `setup_ssh_keys` task still generates the on-node keypair during bootstrap — the pre-imported key does not replace that step. Pre-staging is useful when you want key metadata in the DB before the node is reachable.
+
+### When to use `--rekey=1`
+
+The `--rekey` flag is **not** needed for adding new nodes. It is only needed when:
+- A node's keypair was generated before the encrypted DB was available, so its passphrase was never captured
+- You want to force key rotation on existing nodes (generates a fresh keypair and captures the new passphrase)
+
+```
+# Rekey a single node:
+CLUSTER_DB_KEY="$(cat ../createdatabase/.cluster_db.keyfile)" \
+rex setup_ssh_keys --network=labnet --bootstrap=1 --rekey=1 --machine=node-beta
+
+# Rekey all nodes:
+CLUSTER_DB_KEY="$(cat ../createdatabase/.cluster_db.keyfile)" \
+rex setup_ssh_keys --network=labnet --bootstrap=1 --rekey=1
+```
+
+`--rekey=1` removes the existing keypair and passphrase store files on the target node(s), then regenerates everything from scratch.
 
 ## Operational Notes
 
