@@ -39,7 +39,7 @@ Shared helper module used by the Rexfile (and available to other Rexfiles). Prov
 - `ensure_agent_loaded` — load the admin cluster key into ssh-agent via SSH_ASKPASS
 - `bootstrap_via_askpass` / `bootstrap_run_or_warn` / `bootstrap_capturex` — run commands with password via SSH_ASKPASS + 0400 tempfile
 - `generate_load_cluster_key_script` — generate the node-local key loader script
-- `ensure_io_interface` / `cleanup_io_interface` / `get_mac_for_ip` — IO::Interface helpers for MAC discovery
+- `ensure_io_interface` / `cleanup_io_interface` / `get_mac_for_ip` — IO::Interface helpers for MAC discovery (prefers `apt-get` GPG-signed packages on remote nodes for DISA-STIG compliance; falls back to `cpan` temp install only on admin/perlbrew)
 - And other utilities (`command_exists`, `kh_key`, `run_or_warn`, `shell_quote`, `generate_passphrase`, `bootstrap_remote_mktemp`, `all_networks`)
 
 Loaded via `use FindBin qw($Bin); use lib "$Bin/.."; use ClusterSSHHelpers;` and configured with `ClusterSSHHelpers::init(...)` at startup.

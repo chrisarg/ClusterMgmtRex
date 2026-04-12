@@ -651,6 +651,26 @@ sub ensure_io_interface {
         target => $target,
       );
 
+    # [DISA-STIG / FIPS-140] For remote nodes, prefer apt (GPG-signed .deb)
+    # over cpan (unsigned CPAN downloads) to maintain OS-level chain of trust.
+    if ( !$local ) {
+        try {
+            capturex(
+                'ssh', @ssh_opts, $target,
+                'sudo apt-get install -y libio-interface-perl'
+            );
+        }
+        catch ($e) { }
+
+        # apt install lands in system Perl @INC — no libdir needed
+        return \%state
+          if perl_can_load_io_interface(
+            local  => $local,
+            target => $target,
+          );
+    }
+
+    # Fallback: cpan to temp dir (local/perlbrew admin, or apt unavailable)
     return undef if !command_exists('cpan');
 
     my ( $prefix, $libdir );
