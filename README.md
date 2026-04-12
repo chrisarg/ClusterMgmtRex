@@ -48,7 +48,7 @@ Shared helper module used by the Rexfile (and available to other Rexfiles). Prov
 Loaded via `use FindBin qw($Bin); use lib "$Bin/.."; use ClusterSSHHelpers;` and configured with `ClusterSSHHelpers::init(...)` at startup.
 
 ### cluster_ssh_setup/Rexfile
-Main Rex task file. Defines 14 tasks:
+Main Rex task file. Defines 15 tasks:
 
 | Task | Description |
 |------|-------------|
@@ -57,6 +57,7 @@ Main Rex task file. Defines 14 tasks:
 | `show_keys` | View SSH public key metadata (or full key for one machine) |
 | `show_credentials` | View credential metadata (passwords always redacted) |
 | `check_network` | TCP-probe node reachability on a named network |
+| `refresh_known_hosts` | Rescan and update admin known_hosts for reachable nodes on a network |
 | `nodes_in_network` | List nodes and reachability for one or all networks |
 | `networks_for_node` | List networks and reachability for one or all machines |
 | `show_known_hosts` | Display known_hosts content on each reachable node |
@@ -88,7 +89,7 @@ Reverses all `setup_ssh_keys` changes: removes keypairs, the three node-local pa
 
 - ClusterSSHHelpers.pm: shared helper module (SSH options, audit, bootstrap, IO::Interface)
 - cluster_ssh_setup/
-  - Rexfile: main task automation (14 tasks, security-hardened)
+  - Rexfile: main task automation (15 tasks, security-hardened)
 - cmdb/
   - One YAML per machine
   - Contains only non-secret inventory data (network IPs, optional MAC addresses)

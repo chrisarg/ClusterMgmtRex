@@ -339,6 +339,134 @@ task "check_network", sub {
     say "=" x 60;
 };
 
+# rex refresh_known_hosts --network=<name>              ; rescan host keys for all reachable nodes
+# rex refresh_known_hosts --network=<name> --group=<name> ; limit to a named group (default: all)
+# rex refresh_known_hosts --network=<name> --timeout=<s>  ; TCP ping timeout per node (default: 1)
+# Rescans FIPS-approved host keys from reachable nodes and atomically
+# rebuilds the admin's ~/.ssh/known_hosts. Non-cluster entries are preserved.
+# Use after --rekey=1 or when host key verification fails.
+desc "Rescan and update admin known_hosts for reachable nodes on a network";
+task "refresh_known_hosts", sub {
+    local $| = 1;
+    my $param        = shift || {};
+    my $group_name   = $param->{group}   // 'all';
+    my $network_name = $param->{network}
+      or die "Parameter --network is required.\n";
+    my $ping_timeout = $param->{timeout} // 1;
+
+    die "Group '$group_name' is not defined.\n"
+      unless Rex::Group->is_group($group_name);
+
+    my @group_members = map { "$_" } Rex::Group->get_group($group_name);
+    my $pinger        = tcp_pinger($ping_timeout);
+    my $ssh_dir       = ( $ENV{HOME} // '.' ) . '/.ssh';
+    my $known_hosts   = "$ssh_dir/known_hosts";
+
+    say "=" x 60;
+    say "Refresh Known Hosts (group: $group_name, network: $network_name)";
+    say "=" x 60;
+
+    # 1. Probe reachability and collect IPs
+    my @reachable;
+    for my $machine ( sort @group_members ) {
+        my $networks = get_networks($machine);
+        my $ip       = $networks->{$network_name};
+
+        if ( !$ip ) {
+            say sprintf "%-20s %-15s %s", $machine, '(no ip)', 'MISSING';
+            next;
+        }
+
+        if ( !$pinger->ping($ip) ) {
+            say sprintf "%-20s %-15s %s", $machine, $ip, 'DOWN';
+            next;
+        }
+
+        push @reachable, { machine => $machine, ip => $ip };
+        say sprintf "%-20s %-15s %s", $machine, $ip, 'UP';
+    }
+    $pinger->close;
+
+    if ( !@reachable ) {
+        say "\nNo reachable nodes found. Nothing to do.";
+        return;
+    }
+
+    # 2. Scan host keys from all reachable nodes (FIPS-approved types only)
+    say "\nScanning host keys from " . scalar(@reachable) . " nodes...";
+    my %fresh_entries;    # "$ip $kt" => merged line
+    for my $node (@reachable) {
+        my $ip           = $node->{ip};
+        my $connect_host = $network_name . $node->{machine};
+        say "  - scanning $node->{machine} ($ip)";
+        my $keyscan_out;
+        try {
+            $keyscan_out = capturex( 'ssh-keyscan', '-T', '5',
+                '-t', $FIPS_KEYSCAN_TYPES, $ip );
+        }
+        catch ($e) { }
+        if ( !$keyscan_out ) {
+            say "  ! keyscan failed for $node->{machine} ($ip), skipping";
+            next;
+        }
+        for my $line ( split /\n/, $keyscan_out ) {
+            my ( $hf, $kt, $km ) = kh_key($line);
+            next unless defined $kt;
+            ( my $merged = $line ) =~ s/^\Q$ip\E /$ip,$connect_host /;
+            $fresh_entries{"$ip $kt"} = $merged;
+        }
+    }
+
+    # 3. Build set of cluster host identifiers to replace
+    my %cluster_host_ids;
+    for my $node (@reachable) {
+        $cluster_host_ids{ $node->{ip} } = 1;
+        $cluster_host_ids{ $network_name . $node->{machine} } = 1;
+    }
+
+    # 4. Keep non-cluster, non-hashed entries from existing known_hosts
+    my @kept_existing;
+    if ( -f $known_hosts ) {
+        open my $fh, '<', $known_hosts
+          or die "Cannot read $known_hosts: $!\n";
+        while ( my $l = <$fh> ) {
+            chomp $l;
+            my ( $hf, $kt, $km ) = kh_key($l);
+            next unless defined $kt;
+            next if $hf =~ /^\|/;    # drop hashed entries
+            next
+              if grep { $cluster_host_ids{$_} } split /,/, $hf;
+            push @kept_existing, $l;
+        }
+        close $fh;
+    }
+
+    # 5. Atomic write: kept non-cluster entries + fresh cluster entries
+    my ( $tmp_kh_fh, $tmp_kh ) = tempfile(
+        '.cl_XXXXXXXX',
+        DIR    => $ssh_dir,
+        UNLINK => 0,
+    );
+    say $tmp_kh_fh $_ for @kept_existing;
+    say $tmp_kh_fh $_ for values %fresh_entries;
+    close $tmp_kh_fh;
+    rename $tmp_kh, $known_hosts or die "Cannot rename $tmp_kh: $!\n";
+    CORE::chmod 0600, $known_hosts;
+
+    say "\nUpdated $known_hosts:";
+    say "  " . scalar( keys %fresh_entries ) . " cluster entries refreshed";
+    say "  " . scalar(@kept_existing) . " non-cluster entries preserved";
+    say "=" x 60;
+
+    audit_log(
+        'refresh_known_hosts',
+        network => $network_name,
+        group   => $group_name,
+        cluster => scalar( keys %fresh_entries ),
+        other   => scalar(@kept_existing),
+    );
+};
+
 # rex show_known_hosts --network=<name>               ; show known_hosts on all reachable nodes (network required)
 # rex show_known_hosts --network=<name> --group=<name> ; limit to a named group (default: all)
 # rex show_known_hosts --network=<name> --ssh_retry=<n>; SSH connection attempts (default: 5)
