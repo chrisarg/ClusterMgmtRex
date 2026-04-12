@@ -218,11 +218,11 @@ chmod 400 createdatabase/.cluster_db.keyfile
 
 perl createdatabase/init_cluster_db.pl \
   --keyfile createdatabase/.cluster_db.keyfile \
-  --users-csv system_db_setup/users_db.csv \
-  --import createdatabase/pubkeys
+  --users-csv system_db_setup/users_db.csv
 
 Notes:
-- --import is optional if you have .pub files to pre-load
+- All flags have sensible defaults when run from `createdatabase/`, but explicit paths are needed when running from the repository root
+- The script always imports `.pub` files from `createdatabase/pubkeys/` by default; pass `--import <dir>` only to override that directory
 - Credentials from users_db.csv are encrypted and stored in DB
 
 4) Verify database content (without exposing passwords)
@@ -292,6 +292,9 @@ chmod 400 createdatabase/.cluster_db.keyfile
 perl createdatabase/init_cluster_db.pl \
   --keyfile createdatabase/.cluster_db.keyfile \
   --users-csv system_db_setup/users_db.csv
+
+Note: `.pub` files in `createdatabase/pubkeys/` are imported automatically.
+Pass `--import <dir>` only to override that default directory.
 
 ### C) First-time connection checks
 
