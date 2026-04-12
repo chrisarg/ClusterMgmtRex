@@ -98,54 +98,54 @@ sub init {
     $dbh->do("PRAGMA journal_mode=WAL");
     $dbh->do("PRAGMA secure_delete=ON");
 
-    $dbh->do(<<'SQL');
-CREATE TABLE IF NOT EXISTS pubkeys (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    machine_name TEXT NOT NULL,
-    key_type TEXT NOT NULL,
-    public_key_enc TEXT NOT NULL,
-    fingerprint TEXT NOT NULL DEFAULT '',
-    comment TEXT DEFAULT '',
-    created_at TEXT NOT NULL,
-    rotated_at TEXT,
-    created_by TEXT,
-    UNIQUE(machine_name, key_type)
-)
-SQL
+    $dbh->do(<<~'SQL');
+        CREATE TABLE IF NOT EXISTS pubkeys (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            machine_name TEXT NOT NULL,
+            key_type TEXT NOT NULL,
+            public_key_enc TEXT NOT NULL,
+            fingerprint TEXT NOT NULL DEFAULT '',
+            comment TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            rotated_at TEXT,
+            created_by TEXT,
+            UNIQUE(machine_name, key_type)
+        )
+        SQL
 
-    $dbh->do(<<'SQL');
-CREATE TABLE IF NOT EXISTS credentials (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    machine_name TEXT NOT NULL,
-    username_enc TEXT NOT NULL,
-    password_enc TEXT NOT NULL,
-    comment TEXT DEFAULT '',
-    created_at TEXT NOT NULL,
-    rotated_at TEXT,
-    created_by TEXT,
-    UNIQUE(machine_name)
-)
-SQL
+    $dbh->do(<<~'SQL');
+        CREATE TABLE IF NOT EXISTS credentials (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            machine_name TEXT NOT NULL,
+            username_enc TEXT NOT NULL,
+            password_enc TEXT NOT NULL,
+            comment TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            rotated_at TEXT,
+            created_by TEXT,
+            UNIQUE(machine_name)
+        )
+        SQL
 
-    $dbh->do(<<'SQL');
-CREATE TABLE IF NOT EXISTS db_metadata (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-)
-SQL
+    $dbh->do(<<~'SQL');
+        CREATE TABLE IF NOT EXISTS db_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        SQL
 
-    $dbh->do(<<'SQL');
-CREATE TABLE IF NOT EXISTS key_passphrases (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    machine_name TEXT NOT NULL,
-    passphrase_enc TEXT NOT NULL,
-    comment TEXT DEFAULT '',
-    created_at TEXT NOT NULL,
-    rotated_at TEXT,
-    created_by TEXT,
-    UNIQUE(machine_name)
-)
-SQL
+    $dbh->do(<<~'SQL');
+        CREATE TABLE IF NOT EXISTS key_passphrases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            machine_name TEXT NOT NULL,
+            passphrase_enc TEXT NOT NULL,
+            comment TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            rotated_at TEXT,
+            created_by TEXT,
+            UNIQUE(machine_name)
+        )
+        SQL
 
     my ($existing_salt) =
       $dbh->selectrow_array("SELECT value FROM db_metadata WHERE key = 'salt'");
@@ -207,11 +207,11 @@ sub store_key {
 
     if ($existing_id) {
         $dbh->do(
-            <<'SQL', undef, $encrypted, $fingerprint, $now, $user, $comment, $machine, $key_type );
-UPDATE pubkeys SET public_key_enc = ?, fingerprint = ?, rotated_at = ?,
-    created_by = ?, comment = ?
-WHERE machine_name = ? AND key_type = ?
-SQL
+            <<~'SQL', undef, $encrypted, $fingerprint, $now, $user, $comment, $machine, $key_type );
+                UPDATE pubkeys SET public_key_enc = ?, fingerprint = ?, rotated_at = ?,
+                    created_by = ?, comment = ?
+                WHERE machine_name = ? AND key_type = ?
+                SQL
         $self->_audit(
             'key_rotated',
             machine  => $machine,
@@ -220,11 +220,11 @@ SQL
     }
     else {
         $dbh->do(
-            <<'SQL', undef, $machine, $key_type, $encrypted, $fingerprint, $now, $user, $comment );
-INSERT INTO pubkeys
-    (machine_name, key_type, public_key_enc, fingerprint, created_at, created_by, comment)
-VALUES (?, ?, ?, ?, ?, ?, ?)
-SQL
+            <<~'SQL', undef, $machine, $key_type, $encrypted, $fingerprint, $now, $user, $comment );
+                INSERT INTO pubkeys
+                    (machine_name, key_type, public_key_enc, fingerprint, created_at, created_by, comment)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                SQL
         $self->_audit(
             'key_stored',
             machine  => $machine,
@@ -290,11 +290,11 @@ sub list_keys {
     my ($self) = @_;
     my $dbh = $self->_connect;
 
-    my $sth = $dbh->prepare(<<'SQL');
-SELECT machine_name, key_type, fingerprint, created_at, rotated_at,
-       created_by, comment
-FROM pubkeys ORDER BY machine_name, key_type
-SQL
+    my $sth = $dbh->prepare(<<~'SQL');
+        SELECT machine_name, key_type, fingerprint, created_at, rotated_at,
+            created_by, comment
+        FROM pubkeys ORDER BY machine_name, key_type
+        SQL
     $sth->execute;
 
     my @results;
@@ -341,20 +341,20 @@ sub store_credential {
 
     if ($existing_id) {
         $dbh->do(
-            <<'SQL', undef, $enc_user, $enc_pass, $now, $user, $comment, $machine );
-UPDATE credentials SET username_enc = ?, password_enc = ?, rotated_at = ?,
-    created_by = ?, comment = ?
-WHERE machine_name = ?
-SQL
+            <<~'SQL', undef, $enc_user, $enc_pass, $now, $user, $comment, $machine );
+                UPDATE credentials SET username_enc = ?, password_enc = ?, rotated_at = ?,
+                    created_by = ?, comment = ?
+                WHERE machine_name = ?
+                SQL
         $self->_audit( 'credential_rotated', machine => $machine );
     }
     else {
         $dbh->do(
-            <<'SQL', undef, $machine, $enc_user, $enc_pass, $now, $user, $comment );
-INSERT INTO credentials
-    (machine_name, username_enc, password_enc, created_at, created_by, comment)
-VALUES (?, ?, ?, ?, ?, ?)
-SQL
+            <<~'SQL', undef, $machine, $enc_user, $enc_pass, $now, $user, $comment );
+                INSERT INTO credentials
+                    (machine_name, username_enc, password_enc, created_at, created_by, comment)
+                VALUES (?, ?, ?, ?, ?, ?)
+                SQL
         $self->_audit( 'credential_stored', machine => $machine );
     }
     return 1;
@@ -394,10 +394,10 @@ sub list_credentials {
     my ($self) = @_;
     my $dbh = $self->_connect;
 
-    my $sth = $dbh->prepare(<<'SQL');
-SELECT machine_name, created_at, rotated_at, created_by, comment
-FROM credentials ORDER BY machine_name
-SQL
+    my $sth = $dbh->prepare(<<~'SQL');
+        SELECT machine_name, created_at, rotated_at, created_by, comment
+        FROM credentials ORDER BY machine_name
+        SQL
     $sth->execute;
 
     my @results;
@@ -489,19 +489,19 @@ sub store_key_passphrase {
         undef, $machine );
 
     if ($existing_id) {
-        $dbh->do( <<'SQL', undef, $encrypted, $now, $user, $comment, $machine );
-UPDATE key_passphrases SET passphrase_enc = ?, rotated_at = ?,
-    created_by = ?, comment = ?
-WHERE machine_name = ?
-SQL
+        $dbh->do( <<~'SQL', undef, $encrypted, $now, $user, $comment, $machine );
+            UPDATE key_passphrases SET passphrase_enc = ?, rotated_at = ?,
+                created_by = ?, comment = ?
+            WHERE machine_name = ?
+            SQL
         $self->_audit( 'key_passphrase_rotated', machine => $machine );
     }
     else {
-        $dbh->do( <<'SQL', undef, $machine, $encrypted, $now, $user, $comment );
-INSERT INTO key_passphrases
-    (machine_name, passphrase_enc, created_at, created_by, comment)
-VALUES (?, ?, ?, ?, ?)
-SQL
+        $dbh->do( <<~'SQL', undef, $machine, $encrypted, $now, $user, $comment );
+            INSERT INTO key_passphrases
+                (machine_name, passphrase_enc, created_at, created_by, comment)
+            VALUES (?, ?, ?, ?, ?)
+            SQL
         $self->_audit( 'key_passphrase_stored', machine => $machine );
     }
     return 1;

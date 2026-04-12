@@ -301,11 +301,14 @@ task "check_network", sub {
     local $| = 1;
     my $param        = shift || {};
     my $group_name   = $param->{group}   // 'all';
-    my $network_name = $param->{network} // 'WirA';
+    my $network_name = $param->{network};
     my $ping_timeout = $param->{timeout} // 1;
 
     die "Group '$group_name' is not defined.\n"
       unless Rex::Group->is_group($group_name);
+    die "Parameter --network is required.\n"
+      unless defined $network_name;
+
 
     my @group_members = map { "$_" } Rex::Group->get_group($group_name);
     my $pinger        = tcp_pinger($ping_timeout);
@@ -612,6 +615,7 @@ task "rm_dup_hosts", sub {
 #   (if both --group and --machine are given, --group takes precedence)
 # rex setup_ssh_keys --network=<name> --bootstrap=1 --timeout=<s>       ; TCP probe timeout (default: 1)
 # rex setup_ssh_keys --network=<name> --bootstrap=1 --ssh_retry=<n>     ; SSH connection attempts (default: 5)
+# rex setup_ssh_keys --network=<name> --bootstrap=1 --rekey=1           ; regenerate node keys even if they exist
 #
 # Security Notes:
 #   - Requires --bootstrap=1 for explicit opt-in to password-based auth
@@ -631,6 +635,7 @@ task "rm_dup_hosts", sub {
 #   [4/9] Updates admin ~/.ssh/known_hosts for each reachable node (removes stale entries first)
 #   [5/9] Generates a unique per-node keypair on each reachable node (on-device, private key never leaves)
 #         Key is passphrase-protected; passphrase stored in encrypted database
+#         If --rekey=1, existing keys are removed and regenerated (ensures passphrase capture)
 #         Authorizes admin's public key via ssh-copy-id (admin -> node access)
 #         Deploys node-local encrypted passphrase store (enables autonomous key loading;
 #           files: ~/.ssh/.cluster_node_keyfile, ~/.ssh/.cluster_node_pp, ~/.ssh/load_cluster_key.pl)
@@ -650,6 +655,7 @@ task "setup_ssh_keys", sub {
     my $network_name = $param->{network};
     my $ping_timeout = $param->{timeout}   // 1;
     my $bootstrap    = $param->{bootstrap} // 0;
+    my $rekey        = $param->{rekey}     // 0;
     my $ssh_retry    = $param->{ssh_retry} // $DEFAULT_SSH_RETRY;
     local @ssh_opts           = ssh_opts($ssh_retry);
     local @ssh_opts_bootstrap = ssh_opts_bootstrap($ssh_retry);
@@ -945,6 +951,22 @@ task "setup_ssh_keys", sub {
         }
         catch ($e) { }
         chomp $key_exists;
+
+        if ( $key_exists eq 'YES' && $rekey ) {
+            say "  - --rekey: removing existing keypair on $node->{machine}";
+            bootstrap_run_or_warn( $pass,
+                'sshpass', '-e', 'ssh', @ssh_opts_bootstrap,
+                $target,
+                'rm -f ~/.ssh/id_ecdsa_p521_cluster'
+                  . ' ~/.ssh/id_ecdsa_p521_cluster.pub'
+                  . ' ~/.ssh/.cluster_node_keyfile'
+                  . ' ~/.ssh/.cluster_node_pp'
+                  . ' ~/.ssh/load_cluster_key.pl'
+            );
+            $key_exists = '';
+            audit_log( 'rekey_existing_removed',
+                machine => $node->{machine}, ip => $node->{ip} );
+        }
 
         if ( $key_exists ne 'YES' ) {
 
