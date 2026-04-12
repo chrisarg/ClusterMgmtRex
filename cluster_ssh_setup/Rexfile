@@ -424,8 +424,9 @@ task "refresh_known_hosts", sub {
         $cluster_host_ids{ $network_name . $node->{machine} } = 1;
     }
 
-    # 4. Keep non-cluster, non-hashed entries from existing known_hosts
-    my @kept_existing;
+    # 4. Read existing known_hosts; separate managed (cluster) from unmanaged entries
+    my @kept_unmanaged;
+    my %old_cluster;    # "$ip $kt" => line (for change detection)
     if ( -f $known_hosts ) {
         open my $fh, '<', $known_hosts
           or die "Cannot read $known_hosts: $!\n";
@@ -434,36 +435,68 @@ task "refresh_known_hosts", sub {
             my ( $hf, $kt, $km ) = kh_key($l);
             next unless defined $kt;
             next if $hf =~ /^\|/;    # drop hashed entries
-            next
-              if grep { $cluster_host_ids{$_} } split /,/, $hf;
-            push @kept_existing, $l;
+            if ( grep { $cluster_host_ids{$_} } split /,/, $hf ) {
+                $old_cluster{"$hf $kt"} = $l;
+            }
+            else {
+                push @kept_unmanaged, $l;
+            }
         }
         close $fh;
     }
 
-    # 5. Atomic write: kept non-cluster entries + fresh cluster entries
+    # 5. Atomic write: unmanaged entries + fresh cluster entries
     my ( $tmp_kh_fh, $tmp_kh ) = tempfile(
         '.cl_XXXXXXXX',
         DIR    => $ssh_dir,
         UNLINK => 0,
     );
-    say $tmp_kh_fh $_ for @kept_existing;
+    say $tmp_kh_fh $_ for @kept_unmanaged;
     say $tmp_kh_fh $_ for values %fresh_entries;
     close $tmp_kh_fh;
     rename $tmp_kh, $known_hosts or die "Cannot rename $tmp_kh: $!\n";
     CORE::chmod 0600, $known_hosts;
 
+    # 6. Report what changed
+    my ( @added, @changed, @unchanged );
+    for my $key ( sort keys %fresh_entries ) {
+        my $fresh_line = $fresh_entries{$key};
+        my ( $hf, $kt, $km ) = kh_key($fresh_line);
+        my $old_key = "$hf $kt";
+        if ( !exists $old_cluster{$old_key} ) {
+            push @added, $key;
+        }
+        elsif ( $old_cluster{$old_key} ne $fresh_line ) {
+            push @changed, $key;
+        }
+        else {
+            push @unchanged, $key;
+        }
+    }
+
     say "\nUpdated $known_hosts:";
-    say "  " . scalar( keys %fresh_entries ) . " cluster entries refreshed";
-    say "  " . scalar(@kept_existing) . " non-cluster entries preserved";
+    say "  Managed host keys (nodes on network '$network_name'):";
+    say "    " . scalar(@added)     . " new (not previously in known_hosts)"
+      if @added;
+    say "    " . scalar(@changed)   . " updated (host key changed)"
+      if @changed;
+    say "    " . scalar(@unchanged) . " unchanged (host key already current)"
+      if @unchanged;
+    say "    " . scalar( keys %fresh_entries )
+      . " total entries written for "
+      . scalar(@reachable) . " nodes";
+    say "  Unmanaged host keys (other hosts, not on this network):";
+    say "    " . scalar(@kept_unmanaged) . " entries preserved";
     say "=" x 60;
 
     audit_log(
         'refresh_known_hosts',
-        network => $network_name,
-        group   => $group_name,
-        cluster => scalar( keys %fresh_entries ),
-        other   => scalar(@kept_existing),
+        network   => $network_name,
+        group     => $group_name,
+        added     => scalar(@added),
+        changed   => scalar(@changed),
+        unchanged => scalar(@unchanged),
+        unmanaged => scalar(@kept_unmanaged),
     );
 };
 
