@@ -154,7 +154,7 @@ task "show_cmdb", sub {
     say "CMDB Machine & Network Information (group: $group_name)";
     say "=" x 60;
     for my $machine ( sort @group_members ) {
-        my $networks = get cmdb( 'networks', $machine );
+        my $networks = get_networks($machine);
         my ( $username, undef ) = get_credential($machine);
         say "\nMachine  : $machine";
         say "Username : " . ( $username // '(not set)' );
@@ -318,7 +318,7 @@ task "check_network", sub {
       . " nodes with timeout ${ping_timeout}s";
 
     for my $machine ( sort @group_members ) {
-        my $networks = get cmdb( 'networks', $machine ) // {};
+        my $networks = get_networks($machine);
         my $ip       = $networks->{$network_name};
 
         if ( !$ip ) {
@@ -366,7 +366,7 @@ task "show_known_hosts", sub {
 
     my @summary;
     for my $machine ( sort @group_members ) {
-        my $networks = get cmdb( 'networks', $machine ) // {};
+        my $networks = get_networks($machine);
         my $ip       = $networks->{$network_name};
 
         if ( !$ip ) {
@@ -512,7 +512,7 @@ task "rm_dup_hosts", sub {
 
     my @summary;
     for my $machine ( sort @group_members ) {
-        my $networks = get cmdb( 'networks', $machine ) // {};
+        my $networks = get_networks($machine);
         my $ip       = $networks->{$network_name};
 
         if ( !$ip ) {
@@ -767,7 +767,7 @@ task "setup_ssh_keys", sub {
       . " nodes with timeout ${ping_timeout}s";
 
     for my $machine ( sort @target_members ) {
-        my $networks = get cmdb( 'networks', $machine ) // {};
+        my $networks = get_networks($machine);
         my $ip       = $networks->{$network_name};
 
         if ( !$ip ) {
@@ -1830,7 +1830,7 @@ task "remove_ssh_keys", sub {
       . " nodes with timeout ${ping_timeout}s";
 
     for my $machine ( sort @target_members ) {
-        my $networks = get cmdb( 'networks', $machine ) // {};
+        my $networks = get_networks($machine);
         my $ip       = $networks->{$network_name};
 
         if ( !$ip ) {
@@ -1988,7 +1988,7 @@ task "remove_ssh_keys", sub {
     if ( -f $known_hosts ) {
         my %cluster_ids;
         for my $machine ( sort @machines ) {
-            my $nets = get cmdb( 'networks', $machine ) // {};
+            my $nets = get_networks($machine);
             my $ip   = $nets->{$network_name};
             next unless $ip;
             $cluster_ids{$ip} = 1;
@@ -2049,7 +2049,7 @@ task "remove_ssh_keys", sub {
 
     my %all_cluster_ids;
     for my $machine ( sort @machines ) {
-        my $nets = get cmdb( 'networks', $machine ) // {};
+        my $nets = get_networks($machine);
         for my $net ( keys %$nets ) {
             my $ip = $nets->{$net};
             next unless $ip;
@@ -2177,7 +2177,7 @@ s/\n*# --- cluster_mgmt: auto-generated block ---\n.*?# --- end cluster_mgmt ---
 
     my @network_aliases;
     for my $machine ( sort @machines ) {
-        my $nets = get cmdb( 'networks', $machine ) // {};
+        my $nets = get_networks($machine);
         next unless $nets->{$network_name};
         push @network_aliases, $network_name . $machine;
     }
@@ -2411,7 +2411,7 @@ task "shutdown", sub {
 
     my @summary;
     for my $machine ( sort @group_members ) {
-        my $networks = get cmdb( 'networks', $machine ) // {};
+        my $networks = get_networks($machine);
         my $ip       = $networks->{$network_name};
 
         if ( !$ip ) {
@@ -2492,7 +2492,7 @@ task "nodes_in_network", sub {
 
         my @members;
         for my $m ( sort @machines ) {
-            my $nets = get cmdb( 'networks', $m ) // {};
+            my $nets = get_networks($m);
             my $ip   = $nets->{$net};
             next unless defined $ip;
             push @members, { machine => $m, ip => $ip };
@@ -2539,7 +2539,7 @@ task "networks_for_node", sub {
         printf "%-16s %-15s %s\n", 'Network', 'IP', 'Reachable';
         say "-" x 40;
 
-        my $nets = get cmdb( 'networks', $m ) // {};
+        my $nets = get_networks($m);
 
         if ( !keys %$nets ) {
             say "  (no networks defined for this machine)";
@@ -2607,7 +2607,7 @@ task "obtain_mac", sub {
         say "\nMachine: $m";
         say "-" x 40;
 
-        my $nets = get cmdb( 'networks', $m ) // {};
+        my $nets = get_networks($m);
         my ( $username, undef ) = get_credential($m);
         my $yml_path = "$cmdb_dir/$m.yml";
 
@@ -2785,7 +2785,7 @@ task "validate_ssh_mesh", sub {
     my @unreachable;
 
     for my $machine ( sort @group_members ) {
-        my $networks = get cmdb( 'networks', $machine ) // {};
+        my $networks = get_networks($machine);
         my $ip       = $networks->{$network_name};
 
         if ( !$ip ) {

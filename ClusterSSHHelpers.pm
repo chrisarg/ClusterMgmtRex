@@ -69,6 +69,7 @@ our @EXPORT = qw(
     cleanup_io_interface
     all_networks
     get_mac_for_ip
+    get_networks
     @ssh_opts
     @ssh_opts_bootstrap
 );
@@ -244,7 +245,8 @@ sub detect_admin {
       grep { $_ } split( /\s+/, capturex( 'hostname', '-I' ) );
     my %local_ip_set = map { $_ => 1 } @local_ips;
     for my $m ( sort @machines ) {
-        my $nets = Rex::CMDB::get( 'networks', $m ) // {};
+        my $nets = get_networks($m);
+        next unless ref $nets eq 'HASH';
         if ($network_name) {
             my $ip = $nets->{$network_name};
             if ( $ip && $local_ip_set{$ip} ) {
@@ -746,6 +748,15 @@ sub cleanup_io_interface {
     }
 }
 
+# Safe wrapper around Rex::CMDB::get('networks', $machine).
+# Rex CMDB may return '' instead of undef for missing keys;
+# this always returns a hashref.
+sub get_networks {
+    my ($machine) = @_;
+    my $nets = Rex::CMDB::get( 'networks', $machine );
+    return ref $nets eq 'HASH' ? $nets : {};
+}
+
 # ---------------------------------------------------------------------------
 # Network / MAC helpers
 # ---------------------------------------------------------------------------
@@ -753,7 +764,8 @@ sub cleanup_io_interface {
 sub all_networks {
     my %seen;
     for my $m (@machines) {
-        my $nets = Rex::CMDB::get( 'networks', $m ) // {};
+        my $nets = get_networks($m);
+        next unless ref $nets eq 'HASH';
         $seen{$_}++ for keys %$nets;
     }
     return sort keys %seen;
