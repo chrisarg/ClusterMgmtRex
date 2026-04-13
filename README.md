@@ -48,7 +48,7 @@ Shared helper module used by the Rexfile (and available to other Rexfiles). Prov
 Loaded via `use FindBin qw($Bin); use lib "$Bin/.."; use ClusterSSHHelpers;` and configured with `ClusterSSHHelpers::init(...)` at startup.
 
 ### cluster_ssh_setup/Rexfile
-Main Rex task file. Defines 15 tasks:
+Main Rex task file. Defines 16 tasks:
 
 | Task | Description |
 |------|-------------|
@@ -64,6 +64,7 @@ Main Rex task file. Defines 15 tasks:
 | `rm_dup_hosts` | Remove duplicate known_hosts entries cluster-wide |
 | `setup_ssh_keys` | 9-phase key distribution to build full mesh (bootstrap required) |
 | `remove_ssh_keys` | 8-phase key teardown, inverse of setup (bootstrap + confirm required) |
+| `configure_sudoers_scope` | Install scoped sudoers drop-in on reachable non-admin nodes (bootstrap required) |
 | `shutdown` | Remote shutdown of all non-admin nodes on a network |
 | `obtain_mac` | Discover and store MAC addresses in CMDB YAMLs |
 | `validate_ssh_mesh` | Probe all pairwise SSH connections (password + key) across a group |
@@ -89,7 +90,7 @@ Reverses all `setup_ssh_keys` changes: removes keypairs, the three node-local pa
 
 - ClusterSSHHelpers.pm: shared helper module (SSH options, audit, bootstrap, IO::Interface)
 - cluster_ssh_setup/
-  - Rexfile: main task automation (15 tasks, security-hardened)
+  - Rexfile: main task automation (16 tasks, security-hardened)
 - cmdb/
   - One YAML per machine
   - Contains only non-secret inventory data (network IPs, optional MAC addresses)
@@ -100,7 +101,7 @@ Reverses all `setup_ssh_keys` changes: removes keypairs, the three node-local pa
   - (git-ignored) cluster_keys.db — encrypted SQLite database
   - (git-ignored) .cluster_db.keyfile — master encryption key
 - example_hpc_deployments/
-  - README.md : Examples of provisioning of software for HPC pipelines
+  - README.md : Examples of provisioning of software for HPC pipelines (currently empty)
 - system_db_setup/
   - (git-ignored) users_db.csv: input credentials for encrypted DB import
   - (git-ignored) networks_db.csv: network inventory input
@@ -148,7 +149,7 @@ external rule IDs) that describe the actual security property enforced.
 
 ### sudoers prerequisites for hardened systems
 
-The automation tasks require password-free sudo for exactly two commands on each node. Add to `/etc/sudoers` on each node:
+Operational mode requires password-free sudo for exactly two commands on each node. Add to `/etc/sudoers` on each node:
 
 ```
 <cluster-user> ALL=(root) NOPASSWD: /usr/bin/tee /etc/hosts
@@ -156,6 +157,26 @@ The automation tasks require password-free sudo for exactly two commands on each
 ```
 
 No other `NOPASSWD` rules are required.
+
+The `shutdown` task defaults to `sudo -n` and expects the scoped `NOPASSWD` rule above. It also supports an explicit bootstrap-only fallback:
+
+```
+rex shutdown --network=<name> --bootstrap=1
+```
+
+In bootstrap mode, Rex uses the encrypted DB password for that node to authenticate SSH and to feed `sudo -S` non-interactively. This is intended for first-time setup or repair only; normal operations should use `sudo -n` with the scoped sudoers rule.
+
+You can install the scoped sudoers policy from Rex in one bootstrap pass:
+
+```
+rex configure_sudoers_scope --network=<name> --bootstrap=1
+```
+
+Then use operational shutdown without passwords:
+
+```
+rex shutdown --network=<name>
+```
 
 ---
 
@@ -259,10 +280,18 @@ From cluster_ssh_setup/:
   - First-time bootstrap: 9-phase key distribution and full mesh setup
 - rex remove_ssh_keys --network=<name> --bootstrap=1 --confirm=1
   - Tear down all cluster keys, authorized_keys, known_hosts, config blocks, /etc/hosts aliases
+- rex configure_sudoers_scope --network=<name> --bootstrap=1
+  - Install scoped sudoers drop-in (`/etc/sudoers.d/cluster_mgmt`) for least-privilege operational tasks
 - rex validate_ssh_mesh --network=<name>
   - Test all pairwise SSH connections (password + key) in the group
 - rex shutdown --network=<name>
   - Shutdown reachable non-admin nodes
+
+Shutdown paths:
+- Operational path (preferred): `rex shutdown --network=<name>`
+  - Uses `sudo -n` and requires scoped `NOPASSWD` sudoers entries
+- Bootstrap fallback path: `rex shutdown --network=<name> --bootstrap=1`
+  - Tries `sudo -n` first; if rejected, uses passworded `sudo -S` via encrypted DB credentials
 - rex nodes_in_network
   - Show nodes grouped by network with reachability
 - rex networks_for_node
@@ -598,6 +627,40 @@ This section analyses what an attacker gains — and what remains protected — 
 ## TODO
 
 ### Security Improvements
+
+- **[HIGH] Hardware security keys**: Deploy a FIDO2/PIV hardware token (e.g. YubiKey 5 series) for the admin identity. This has two distinct roles in this codebase:
+
+  **Role 1 — Protect the master keyfile (replaces `.cluster_db.keyfile` on disk)**
+  Currently the keyfile is a 0400 plaintext file on the admin filesystem. Any process running as the cluster user can read it, and an attacker who compromises the admin gains permanent offline decryption capability for `cluster_keys.db` (all passwords, all key passphrases). Replacing the keyfile with a hardware-backed secret eliminates this: the decryption key is stored in the token's secure element, operations are performed on-chip (private key never exported), and the token requires a PIN and/or physical touch to authorize each use. Implementation: use the token's PIV slot (`ykman piv` or `openssl` with a PKCS#11 engine via `p11-kit`) to wrap the DB encryption key. Add a `--keyfile-cmd` option to `ClusterSSHHelpers::init()` that executes an external command instead of reading a plaintext file. This directly implements the **[HIGH] Separate keyfile from encrypted DB** item in the Blast-Radius Reduction section.
+
+  **Role 2 — SSH authentication with hardware-resident keys (admin identity)**
+  Replace or supplement `~/.ssh/id_ecdsa_p521_cluster` on the admin with a FIDO2 resident key (`ssh-keygen -t ecdsa-sk -O resident`). The private key half lives in the token; login requires both possession of the token and a PIN/touch gesture. A compromised admin filesystem yields only the key handle, which is useless without the physical token. OpenSSH >= 8.2 supports this natively; no agent changes are needed beyond `ssh-add -K` to load resident keys.
+
+  **What this accomplishes**
+
+  | Property | Without hardware key | With hardware key |
+  |---|---|---|
+  | Admin filesystem compromise → DB decryptable offline | Yes | No — token required for each decrypt |
+  | Stolen admin SSH private key → cluster access | Yes — passphrase is in the DB on the same disk | No — key half is on token; PIN/touch required |
+  | Unattended `rex` invocation | Yes — ssh-agent + plaintext keyfile | Requires token present + PIN; intentional friction |
+  | Audit trail for key use | Software log only | Hardware attestation certificate + software log |
+
+  **How it extends the current setup**
+  The existing `ensure_agent_loaded` and `bootstrap_via_askpass` helpers already isolate credentials via `SSH_ASKPASS` tempfiles (`[SEC-CRED-ENCRYPT]`). Hardware keys slot in at the admin-identity layer only — no changes to node-side key management, bootstrap SSH flows, or the `configure_sudoers_scope`/`setup_ssh_keys` task structure. The `--keyfile-cmd` option is a drop-in replacement for the `$cluster_db_keyfile` path in `ClusterSSHHelpers::init()`.
+
+  **Blast-radius reduction**
+  - Eliminates the **offline DB decryption** attack (the catastrophic path in Scenario 2 of the Blast Radius Analysis): attacker has the ciphertext but cannot decrypt without the physical token.
+  - Eliminates **stolen admin key → immediate cluster access** without also stealing the physical token.
+  - Bounds admin compromise to the window of active token presence rather than making it permanent.
+  - Does not reduce the blast radius of a worker compromise — worker keys are software keys; that is a separate per-network key isolation problem.
+
+  **How it enables other TODO items**
+  - **[HIGH] Separate keyfile from encrypted DB** (Blast-Radius Reduction section): This IS the implementation of that item. Hardware token = keyfile off the admin filesystem with on-chip private key.
+  - **[HIGH] Purge passwords from DB after bootstrap**: Hardware-key assurance makes exclusive key-based auth credible; once the DB is unreachable without the token, the residual risk of leaving passwords in the DB is bounded and the incentive to purge them increases.
+  - **[HIGH] Disable password auth cluster-wide**: Confidence that the admin identity is hardware-bound makes it safe to remove the password fallback path entirely — the only remaining bootstrap path is the explicit, audited `configure_sudoers_scope` flow.
+  - **[MEDIUM] Intrusion-detection tripwires**: The token's attestation certificate (`ykman piv info`) provides a cryptographic root-of-trust anchor for key manifests. Without hardware attestation the manifest itself can be forged by an attacker with filesystem access.
+  - **[LOW] Enforce key expiry**: The token serial number and certificate `notAfter` field give a hardware-anchored expiry signal that is harder to tamper with than a `created_at` timestamp in the DB.
+  - **[LOW] Zero sensitive strings in memory**: Hardware keys remove one of the two high-value secrets held in memory (the DB decryption key); the admin SSH key passphrase also moves off-memory (on-chip). Node-side passphrases stored in the DB remain the primary residual concern for in-memory zeroing.
 
 - **[MEDIUM] Comma-in-password CSV limitation**: `users_db.csv` is parsed with `split /\s*,\s*/, $_, 3`. Passwords containing commas are silently truncated. Switch to `Text::CSV` (or `Text::CSV_XS`) to support RFC 4180 quoting in both `generate_cmdb.pl` and `init_cluster_db.pl`.
 

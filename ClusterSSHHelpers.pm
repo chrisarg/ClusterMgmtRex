@@ -61,6 +61,7 @@ our @EXPORT = qw(
     bootstrap_via_askpass
     bootstrap_run_or_warn
     bootstrap_capturex
+    bootstrap_sudo_run_or_warn
     generate_load_cluster_key_script
     bootstrap_remote_mktemp
     io_interface_probe_code
@@ -437,7 +438,7 @@ sub bootstrap_via_askpass {
 
     my ( $pw_fh, $pw_file ) =
       tempfile( '.cl_XXXXXXXX', DIR => '/tmp', UNLINK => 1 );
-    print $pw_fh $password;
+    print $pw_fh "$password\n";
     close $pw_fh;
     CORE::chmod 0400, $pw_file;
 
@@ -481,6 +482,50 @@ sub bootstrap_capturex {
         sub { capturex(@_) },
         @cmd,
     );
+}
+
+sub bootstrap_sudo_run_or_warn {
+    my ( $password, $target, @remote_cmd ) = @_;
+    die "bootstrap_sudo_run_or_warn requires a target and remote command\n"
+      unless defined $target && @remote_cmd;
+
+    # SSH_ASKPASS shim handles SSH password authentication (same as
+    # bootstrap_via_askpass). Pipe stdin handles sudo -S password input.
+    # Both are needed: SSH_ASKPASS prevents SSH from consuming stdin for
+    # its own auth, leaving stdin free to pipe through to the remote sudo.
+    my ( $pw_fh, $pw_file ) =
+      tempfile( '.cl_XXXXXXXX', DIR => '/tmp', UNLINK => 1 );
+    print $pw_fh $password;    # no newline needed; cat supplies it to askpass
+    close $pw_fh;
+    CORE::chmod 0400, $pw_file;
+
+    my ( $ap_fh, $ap_script ) =
+      tempfile( '.cl_XXXXXXXX', DIR => '/tmp', UNLINK => 1 );
+    print $ap_fh "#!/bin/sh\ncat $pw_file\n";
+    close $ap_fh;
+    CORE::chmod 0500, $ap_script;
+
+    my $remote = 'sudo -S -p "" -- '
+      . join( ' ', map { shell_quote($_) } @remote_cmd );
+
+    local $ENV{SSH_ASKPASS}         = $ap_script;
+    local $ENV{SSH_ASKPASS_REQUIRE} = 'force';
+    local $ENV{DISPLAY}             = $ENV{DISPLAY} // ':0';
+    delete local $ENV{SSHPASS};
+
+    my $ok = 0;
+    my $err;
+    try {
+        open( my $pipe, '|-', 'ssh', @ssh_opts_bootstrap, $target, $remote )
+          or die "Cannot open ssh pipe to $target: $!\n";
+        print $pipe "$password\n";    # newline required for sudo -S
+        close $pipe;
+        $ok = ( $? == 0 ) ? 1 : 0;
+    }
+    catch ($e) { $err = $e; }
+    unlink $pw_file, $ap_script;
+    warn $err if $err;
+    return $ok;
 }
 
 # ---------------------------------------------------------------------------

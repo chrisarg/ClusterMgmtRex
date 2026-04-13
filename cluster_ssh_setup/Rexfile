@@ -2553,12 +2553,183 @@ s/\n*# --- cluster_mgmt: auto-generated block ---\n.*?# --- end cluster_mgmt ---
     say "=" x 60;
 };
 
-# rex shutdown --network=<name>               ; shutdown all non-admin nodes on the network (required)
+# rex configure_sudoers_scope --network=<name>                 ; install scoped sudoers drop-in on reachable non-admin nodes
+# rex configure_sudoers_scope --network=<name> --group=<name> ; limit to a named group (default: all)
+# rex configure_sudoers_scope --network=<name> --timeout=<s>  ; TCP probe timeout (default: 1)
+# rex configure_sudoers_scope --network=<name> --ssh_retry=<n>; SSH connection attempts (default: 5)
+# rex configure_sudoers_scope --network=<name> --bootstrap=1   ; required (uses passworded sudo for first-time setup)
+# Installs /etc/sudoers.d/cluster_mgmt with least-privilege rules:
+#   - /usr/bin/tee /etc/hosts
+#   - /usr/sbin/shutdown
+#   - /sbin/shutdown
+# Validates with visudo before and after install.
+desc "Install scoped sudoers drop-in for cluster operations on reachable non-admin nodes";
+task "configure_sudoers_scope", sub {
+    local $| = 1;
+    require_cluster_key();
+    ensure_agent_loaded();
+
+    my $param        = shift || {};
+    my $group_name   = $param->{group} // 'all';
+    my $network_name = $param->{network}
+      or die "Parameter --network is required.\n";
+    my $bootstrap    = $param->{bootstrap} // 0;
+    my $ping_timeout = $param->{timeout}   // 1;
+    my $ssh_retry    = $param->{ssh_retry} // $DEFAULT_SSH_RETRY;
+    local @ssh_opts           = ssh_opts($ssh_retry);
+    local @ssh_opts_bootstrap = ssh_opts_bootstrap($ssh_retry);
+
+    die "Group '$group_name' is not defined.\n"
+      unless Rex::Group->is_group($group_name);
+    die "configure_sudoers_scope requires --bootstrap=1 for first-time privileged setup.\n"
+      unless $bootstrap;
+
+    audit_log(
+        'configure_sudoers_scope_start',
+        group   => $group_name,
+        network => $network_name
+    );
+
+    my @group_members = map { "$_" } Rex::Group->get_group($group_name);
+    my $pinger        = tcp_pinger($ping_timeout);
+
+    my ( $admin_ip, $admin_machine ) = detect_admin($network_name);
+    say "  - admin machine: " . ( $admin_machine // '(unknown)' );
+
+    say "=" x 60;
+    say "Configure Scoped Sudoers (group: $group_name, network: $network_name)";
+    say "=" x 60;
+
+    my @summary;
+    for my $machine ( sort @group_members ) {
+        my $networks = get_networks($machine);
+        my $ip       = $networks->{$network_name};
+
+        if ( !$ip ) {
+            say sprintf "%-20s %-15s %s", $machine, '(no ip)', 'MISSING';
+            push @summary, { machine => $machine, status => 'MISSING' };
+            next;
+        }
+
+        if ( defined $admin_machine && $machine eq $admin_machine ) {
+            say sprintf "%-20s %-15s %s", $machine, $ip, 'ADMIN (skipped)';
+            push @summary, { machine => $machine, status => 'ADMIN' };
+            next;
+        }
+
+        if ( !$pinger->ping($ip) ) {
+            say sprintf "%-20s %-15s %s", $machine, $ip, 'DOWN (skipped)';
+            push @summary, { machine => $machine, status => 'DOWN' };
+            next;
+        }
+
+        my ( $username, $password ) = get_credential($machine);
+        if ( !$username || !$password ) {
+            say sprintf "%-20s %-15s %s", $machine, $ip,
+              'SKIP (missing credentials)';
+            push @summary, { machine => $machine, status => 'SKIP' };
+            next;
+        }
+
+        my $target = "$username\@$ip";
+        say sprintf "%-20s %-15s %s", $machine, $ip, 'applying sudoers...';
+
+        my ( $tmp_fh, $tmp_local ) = tempfile(
+            '.cl_XXXXXXXX',
+            DIR    => '/tmp',
+            UNLINK => 1,
+        );
+        print $tmp_fh "$username ALL=(root) NOPASSWD: /usr/bin/tee /etc/hosts\n";
+        print $tmp_fh "$username ALL=(root) NOPASSWD: /usr/sbin/shutdown\n";
+        print $tmp_fh "$username ALL=(root) NOPASSWD: /sbin/shutdown\n";
+        close $tmp_fh;
+        CORE::chmod 0400, $tmp_local;
+
+        my $ok    = 0;
+        my $r_tmp = '';
+        try {
+            $r_tmp = bootstrap_remote_mktemp( $password, $target,
+                '/tmp/.cl_XXXXXXXX' );
+
+            my $copied = bootstrap_run_or_warn( $password, 'sshpass', '-e', 'scp',
+                @ssh_opts_bootstrap, $tmp_local, "$target:$r_tmp" );
+            die "copy failed\n" unless $copied;
+
+            my $precheck = bootstrap_sudo_run_or_warn(
+                $password,
+                $target,
+                'visudo', '-cf', $r_tmp
+            );
+            die "visudo precheck failed\n" unless $precheck;
+
+            my $installed = bootstrap_sudo_run_or_warn(
+                $password,
+                $target,
+                'install', '-m', '0440', $r_tmp, '/etc/sudoers.d/cluster_mgmt'
+            );
+            die "install failed\n" unless $installed;
+
+            my $postcheck = bootstrap_sudo_run_or_warn(
+                $password,
+                $target,
+                'visudo', '-cf', '/etc/sudoers.d/cluster_mgmt'
+            );
+            die "visudo postcheck failed\n" unless $postcheck;
+
+            $ok = 1;
+        }
+        catch ($e) {
+            $ok = 0;
+        }
+
+        unlink $tmp_local if -f $tmp_local;
+        if ( $r_tmp && length $r_tmp ) {
+            bootstrap_run_or_warn( $password, 'sshpass', '-e', 'ssh',
+                @ssh_opts_bootstrap, $target, "rm -f $r_tmp" );
+        }
+
+        push @summary,
+          { machine => $machine, status => $ok ? 'CONFIGURED' : 'FAILED' };
+        audit_log(
+            'configure_sudoers_scope_node',
+            machine => $machine,
+            ip      => $ip,
+            result  => $ok ? 'OK' : 'FAILED'
+        );
+    }
+
+    $pinger->close;
+
+    say "";
+    say "=" x 60;
+    say "Summary";
+    say "=" x 60;
+    printf "%-24s %s\n", 'Machine', 'Status';
+    say "-" x 36;
+    printf "%-24s %s\n", $_->{machine}, $_->{status} for @summary;
+    say "=" x 60;
+
+    my $failed = scalar grep { ( $_->{status} // '' ) eq 'FAILED' } @summary;
+    if ($failed) {
+        die "configure_sudoers_scope failed on $failed node(s). See summary above.\n";
+    }
+
+    audit_log(
+        'configure_sudoers_scope_complete',
+        group   => $group_name,
+        network => $network_name,
+        failed  => $failed
+    );
+};
+
+# rex shutdown --network=<name>                 ; shutdown all non-admin nodes on the network (required)
 # rex shutdown --network=<name> --group=<name> ; limit to a named group (default: all)
 # rex shutdown --network=<name> --timeout=<s>  ; TCP probe timeout (default: 1)
 # rex shutdown --network=<name> --ssh_retry=<n>; SSH connection attempts (default: 5)
-# Requires cluster SSH key (run setup_ssh_keys --bootstrap=1 first)
-# STIG: uses passwordless sudo (NOPASSWD in sudoers for shutdown command)
+# rex shutdown --network=<name> --bootstrap=1   ; fallback to passworded sudo over bootstrap SSH
+# Requires cluster SSH key (run setup_ssh_keys --network=<name> --bootstrap=1 first)
+# Operational mode: uses sudo -n with scoped NOPASSWD sudoers for shutdown.
+# Bootstrap mode: passworded sudo fallback using encrypted DB credentials.
 desc "Shutdown all reachable non-admin nodes on a network";
 task "shutdown", sub {
     local $| = 1;
@@ -2569,6 +2740,7 @@ task "shutdown", sub {
     my $group_name   = $param->{group} // 'all';
     my $network_name = $param->{network}
       or die "Parameter --network is required.\n";
+        my $bootstrap    = $param->{bootstrap} // 0;
     my $ping_timeout = $param->{timeout}   // 1;
     my $ssh_retry    = $param->{ssh_retry} // $DEFAULT_SSH_RETRY;
     local @ssh_opts = ssh_opts($ssh_retry);
@@ -2591,6 +2763,10 @@ task "shutdown", sub {
     say "=" x 60;
     say "Shutdown Nodes (group: $group_name, network: $network_name)";
     say "=" x 60;
+        say "Mode: "
+            . ( $bootstrap
+                ? 'bootstrap fallback allowed (passworded sudo if needed)'
+                : 'operational (sudo -n with scoped NOPASSWD sudoers)' );
 
     my @summary;
     for my $machine ( sort @group_members ) {
@@ -2615,7 +2791,7 @@ task "shutdown", sub {
             next;
         }
 
-        my ( $username, undef ) = get_credential($machine);
+        my ( $username, $password ) = get_credential($machine);
 
         if ( !$username ) {
             say sprintf "%-20s %-15s %s", $machine, $ip, 'SKIP (no username)';
@@ -2626,15 +2802,36 @@ task "shutdown", sub {
         my $target = "$username\@$ip";
         say sprintf "%-20s %-15s %s", $machine, $ip, 'sending shutdown...';
 
-        # STIG: passwordless sudo (NOPASSWD in sudoers for shutdown)
-        my $ok =
-          run_or_warn( 'ssh', @ssh_opts, $target, 'sudo shutdown -h now' );
+        # Operational path: strict non-interactive sudo with scoped NOPASSWD.
+        my $ok = run_or_warn(
+            'ssh', @ssh_opts, $target,
+            'sudo -n /usr/sbin/shutdown -h now'
+        );
+
+        # Bootstrap fallback: passworded sudo over passworded SSH, opt-in only.
+        if ( !$ok && $bootstrap ) {
+            if ( !$password ) {
+                say "  ! $machine ($ip): bootstrap fallback unavailable (missing password)";
+            }
+            else {
+                say "  ! $machine ($ip): sudo -n rejected; trying bootstrap passworded sudo";
+                $ok = bootstrap_sudo_run_or_warn(
+                    $password,
+                    $target,
+                    '/usr/sbin/shutdown', '-h', 'now'
+                );
+            }
+        }
+
         push @summary,
           { machine => $machine, status => $ok ? 'SENT' : 'FAILED' };
         audit_log(
             'shutdown_sent',
             machine => $machine,
             ip      => $ip,
+            mode    => $ok
+            ? ( $bootstrap ? 'sudo-n-or-bootstrap' : 'sudo-n' )
+            : ( $bootstrap ? 'sudo-n-plus-bootstrap' : 'sudo-n' ),
             result  => $ok ? 'OK' : 'FAILED'
         );
     }
@@ -2649,6 +2846,11 @@ task "shutdown", sub {
     say "-" x 36;
     printf "%-24s %s\n", $_->{machine}, $_->{status} for @summary;
     say "=" x 60;
+
+    my $failed = scalar grep { ( $_->{status} // '' ) eq 'FAILED' } @summary;
+    if ($failed) {
+        die "shutdown failed on $failed node(s). See summary above.\n";
+    }
 };
 
 # rex nodes_in_network                    ; show all networks and their members + reachability
